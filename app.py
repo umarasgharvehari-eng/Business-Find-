@@ -8,9 +8,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# Optional AI support:
-# - Groq via OpenAI-compatible API
-# - OpenAI directly
 try:
     from openai import OpenAI
 except Exception:
@@ -18,30 +15,35 @@ except Exception:
 
 
 st.set_page_config(page_title="Business Finder", layout="wide")
-st.title("Business Finder - Free Version")
+st.title("Business Finder")
 st.caption("OSM (Nominatim + Overpass) based search. Best for MVP/demo use.")
 
 
-# -----------------------------
-# Config
-# -----------------------------
-APP_USER_AGENT = "business-finder-app/1.0 (contact: your-email@example.com)"
+# =============================
+# CONFIG
+# =============================
 REQUEST_TIMEOUT = 30
+
+# Apna real email yahan likho
+APP_USER_AGENT = "Business Finder/1.0 (contact: your-email@gmail.com)"
+
+# Streamlit app deploy hone ke baad yahan apna app URL laga dena
+# Local testing ke liye localhost theek hai
+APP_REFERER = "http://localhost:8501"
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 DEFAULT_CATEGORY_MAP = {
     "pizza house": [
-        {"key": "amenity", "value": "restaurant"},
         {"key": "cuisine", "value": "pizza"},
-        {"key": "shop", "value": "pizza"},
+        {"key": "amenity", "value": "restaurant"},
         {"key": "amenity", "value": "fast_food"},
+        {"key": "shop", "value": "pizza"},
     ],
     "pizza": [
-        {"key": "amenity", "value": "restaurant"},
         {"key": "cuisine", "value": "pizza"},
-        {"key": "shop", "value": "pizza"},
+        {"key": "amenity", "value": "restaurant"},
         {"key": "amenity", "value": "fast_food"},
     ],
     "restaurant": [
@@ -54,19 +56,17 @@ DEFAULT_CATEGORY_MAP = {
     ],
     "cafe": [
         {"key": "amenity", "value": "cafe"},
-        {"key": "amenity", "value": "coffee_shop"},
     ],
     "cafes": [
         {"key": "amenity", "value": "cafe"},
-        {"key": "amenity", "value": "coffee_shop"},
     ],
     "software house": [
-        {"key": "office", "value": "company"},
         {"key": "office", "value": "it"},
+        {"key": "office", "value": "company"},
     ],
     "software houses": [
-        {"key": "office", "value": "company"},
         {"key": "office", "value": "it"},
+        {"key": "office", "value": "company"},
     ],
     "hotel": [
         {"key": "tourism", "value": "hotel"},
@@ -87,9 +87,9 @@ DEFAULT_CATEGORY_MAP = {
 }
 
 
-# -----------------------------
-# Secrets / Env helpers
-# -----------------------------
+# =============================
+# SECRETS / ENV
+# =============================
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
@@ -102,14 +102,13 @@ def get_secret(name: str, default: str = "") -> str:
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
-# Optional models
-GROQ_MODEL = get_secret("GROQ_MODEL", "openai/gpt-oss-120b")
-OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-5.4-mini")
+GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.1-8b-instant")
+OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 
-# -----------------------------
-# AI client
-# -----------------------------
+# =============================
+# AI CLIENT
+# =============================
 def get_ai_client_and_mode():
     if OpenAI is None:
         return None, None
@@ -129,15 +128,6 @@ def get_ai_client_and_mode():
 
 
 def ai_normalize_query(raw_query: str):
-    """
-    Returns:
-        {
-          "normalized_query": str,
-          "category": str,
-          "keywords": [str],
-          "tags": [{"key": "...", "value": "..."}]
-        }
-    """
     lower = raw_query.strip().lower()
     fallback_tags = DEFAULT_CATEGORY_MAP.get(lower, [{"key": "name", "value": lower}])
 
@@ -157,7 +147,7 @@ normalized_query, category, keywords, tags
 
 Rules:
 - tags must be a list of objects with keys: key, value
-- Keep tags small and practical for OpenStreetMap
+- Keep tags practical for OpenStreetMap
 - If unsure, return a broad safe tag set
 - No markdown
 """
@@ -179,27 +169,16 @@ Example output:
 """
 
     try:
-        if mode == "groq":
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-            )
-            content = resp.choices[0].message.content
-        else:
-            # OpenAI chat-compatible models via chat.completions for simplicity
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-            )
-            content = resp.choices[0].message.content
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL if mode == "groq" else OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+        )
+
+        content = resp.choices[0].message.content
 
         import json
         data = json.loads(content)
@@ -224,13 +203,14 @@ Example output:
         }
 
 
-# -----------------------------
-# HTTP helpers
-# -----------------------------
+# =============================
+# HTTP HELPERS
+# =============================
 def get_headers():
     return {
         "User-Agent": APP_USER_AGENT,
         "Accept-Language": "en",
+        "Referer": APP_REFERER,
     }
 
 
@@ -246,18 +226,32 @@ def safe_request(method: str, url: str, **kwargs):
     )
 
 
-# -----------------------------
-# OSM helpers
-# -----------------------------
+# =============================
+# OSM HELPERS
+# =============================
 def geocode_city(city: str, country: str):
     params = {
-        "q": f"{city}, {country}",
+        "city": city,
+        "country": country,
         "format": "jsonv2",
         "limit": 1,
     }
+
     r = safe_request("GET", NOMINATIM_URL, params=params)
     r.raise_for_status()
     data = r.json()
+
+    if not data:
+        # fallback
+        params = {
+            "q": f"{city}, {country}",
+            "format": "jsonv2",
+            "limit": 1,
+        }
+        r = safe_request("GET", NOMINATIM_URL, params=params)
+        r.raise_for_status()
+        data = r.json()
+
     if not data:
         return None
 
@@ -266,7 +260,7 @@ def geocode_city(city: str, country: str):
         "display_name": item.get("display_name", ""),
         "lat": float(item["lat"]),
         "lon": float(item["lon"]),
-        "boundingbox": item.get("boundingbox", []),  # [south, north, west, east]
+        "boundingbox": item.get("boundingbox", []),
     }
 
 
@@ -277,6 +271,7 @@ def build_overpass_query(bounds, tags, text_query=""):
     for tag in tags:
         key = tag.get("key", "").strip()
         value = tag.get("value", "").strip()
+
         if not key or not value:
             continue
 
@@ -293,7 +288,7 @@ def build_overpass_query(bounds, tags, text_query=""):
         parts.append(f'relation{name_selector}({south},{west},{north},{east});')
 
     query = f"""
-    [out:json][timeout:30];
+    [out:json][timeout:40];
     (
       {' '.join(parts)}
     );
@@ -310,9 +305,9 @@ def overpass_search(bounds, tags, text_query=""):
     return data.get("elements", [])
 
 
-# -----------------------------
-# Enrichment helpers
-# -----------------------------
+# =============================
+# ENRICHMENT HELPERS
+# =============================
 def normalize_website(tags):
     website = (
         tags.get("website")
@@ -323,6 +318,7 @@ def normalize_website(tags):
 
     if website and not website.startswith(("http://", "https://")):
         website = "https://" + website
+
     return website
 
 
@@ -340,7 +336,6 @@ def build_logo_url(website: str):
     domain = extract_domain(website)
     if not domain:
         return ""
-    # Simple favicon guess
     return f"https://{domain}/favicon.ico"
 
 
@@ -373,6 +368,7 @@ def extract_email_from_website(website: str):
             found = email_pattern.findall(text)
             if found:
                 return found[0]
+
         except Exception:
             continue
 
@@ -405,12 +401,12 @@ def normalize_address(tags):
         tags.get("addr:postcode", ""),
         tags.get("addr:country", ""),
     ]
-    text = ", ".join([p for p in parts if p])
-    return text.strip(", ")
+    return ", ".join([p for p in parts if p]).strip(", ")
 
 
 def element_to_record(el):
     tags = el.get("tags", {}) or {}
+
     lat = el.get("lat")
     lon = el.get("lon")
 
@@ -421,26 +417,24 @@ def element_to_record(el):
 
     website = normalize_website(tags)
     email = normalize_email(tags)
+
     if not email and website:
         email = extract_email_from_website(website)
 
-    address = normalize_address(tags)
-
-    record = {
+    return {
         "name": tags.get("name", ""),
         "category": tags.get("amenity") or tags.get("shop") or tags.get("office") or tags.get("tourism") or "",
         "phone": normalize_phone(tags),
         "email": email,
         "website": website,
         "logo_url": build_logo_url(website),
-        "address": address,
+        "address": normalize_address(tags),
         "latitude": lat,
         "longitude": lon,
         "osm_type": el.get("type", ""),
         "osm_id": el.get("id", ""),
         "maps_link": f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}" if lat and lon else "",
     }
-    return record
 
 
 def dedupe_records(records):
@@ -455,17 +449,19 @@ def dedupe_records(records):
             str(item.get("latitude") or ""),
             str(item.get("longitude") or ""),
         )
+
         if key in seen:
             continue
+
         seen.add(key)
         final.append(item)
 
     return final
 
 
-# -----------------------------
-# Search pipeline
-# -----------------------------
+# =============================
+# MAIN SEARCH
+# =============================
 def search_businesses(city: str, country: str, raw_query: str):
     geo = geocode_city(city, country)
     if not geo:
@@ -474,7 +470,7 @@ def search_businesses(city: str, country: str, raw_query: str):
     if len(geo["boundingbox"]) != 4:
         raise ValueError("Bounding box not found for location.")
 
-    # Nominatim public API policy asks low-rate use
+    # Nominatim public server ke liye slow request rakho
     time.sleep(1.1)
 
     south = float(geo["boundingbox"][0])
@@ -493,30 +489,23 @@ def search_businesses(city: str, country: str, raw_query: str):
 
     records = [element_to_record(el) for el in elements]
 
-    # Filter weak rows
     clean = []
-    q = raw_query.strip().lower()
     for rec in records:
-        name = (rec.get("name") or "").lower()
-        cat = (rec.get("category") or "").lower()
-        website = (rec.get("website") or "").lower()
-
         if rec.get("name") or rec.get("phone") or rec.get("website"):
-            if q in name or q in cat or q in website or True:
-                clean.append(rec)
+            clean.append(rec)
 
     return dedupe_records(clean), geo, ai_query
 
 
-# -----------------------------
+# =============================
 # UI
-# -----------------------------
+# =============================
 with st.sidebar:
     st.header("Search Filters")
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
     query = st.text_input("What do you want to search?", value="pizza house")
-    limit = st.slider("Max results to show", 10, 200, 50, 10)
+    limit = st.slider("Max results to show", 10, 200, 20, 10)
     only_with_phone = st.checkbox("Only show items with phone")
     only_with_website = st.checkbox("Only show items with website")
     search_btn = st.button("Search", type="primary")
@@ -568,6 +557,7 @@ if search_btn:
                 )
 
                 st.subheader("Cards View")
+
                 for item in results:
                     with st.container(border=True):
                         cols = st.columns([1, 3])
@@ -575,7 +565,10 @@ if search_btn:
                         with cols[0]:
                             logo = item.get("logo_url", "")
                             if logo:
-                                st.image(logo, width=64)
+                                try:
+                                    st.image(logo, width=64)
+                                except Exception:
+                                    st.write("No logo")
                             else:
                                 st.write("No logo")
 
@@ -592,6 +585,4 @@ if search_btn:
             st.error(f"Error: {e}")
 
 st.markdown("---")
-st.caption(
-    "For demo/MVP use. Public OSM endpoints ka data har business ke liye complete nahi hota."
-)
+st.caption("For demo/MVP use. Public OSM endpoints ka data har business ke liye complete nahi hota.")
