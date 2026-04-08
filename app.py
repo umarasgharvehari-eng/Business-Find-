@@ -1,98 +1,26 @@
 import os
-import re
 import time
-import json
-from typing import List, Dict, Any, Tuple
-from urllib.parse import urlparse
-
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-st.set_page_config(page_title="Business Finder RAG", layout="wide")
-st.title("Business Finder RAG")
-st.caption("RAG-based business search with table output.")
+st.set_page_config(page_title="Business Finder", layout="wide")
+st.title("Business Finder")
+st.caption("Geoapify-based business search with table output.")
 
 
 # =========================================================
 # CONFIG
 # =========================================================
-REQUEST_TIMEOUT = 40
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
-    "https://z.overpass-api.de/api/interpreter",
-]
+REQUEST_TIMEOUT = 30
 
-APP_USER_AGENT = "Business Finder RAG/1.0 (contact: umarasgharvehari@gmail.com)"
-APP_REFERER = "https://business-finder-rag.streamlit.app"
-
-CONTACT_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us", "/services"]
-
-DEFAULT_CATEGORY_MAP = {
-    "pizza house": [
-        {"key": "cuisine", "value": "pizza"},
-        {"key": "amenity", "value": "restaurant"},
-        {"key": "amenity", "value": "fast_food"},
-    ],
-    "pizza": [
-        {"key": "cuisine", "value": "pizza"},
-        {"key": "amenity", "value": "restaurant"},
-        {"key": "amenity", "value": "fast_food"},
-    ],
-    "restaurant": [
-        {"key": "amenity", "value": "restaurant"},
-        {"key": "amenity", "value": "fast_food"},
-    ],
-    "restaurants": [
-        {"key": "amenity", "value": "restaurant"},
-        {"key": "amenity", "value": "fast_food"},
-    ],
-    "cafe": [
-        {"key": "amenity", "value": "cafe"},
-    ],
-    "cafes": [
-        {"key": "amenity", "value": "cafe"},
-    ],
-    "software house": [
-        {"key": "office", "value": "it"},
-        {"key": "office", "value": "company"},
-    ],
-    "software houses": [
-        {"key": "office", "value": "it"},
-        {"key": "office", "value": "company"},
-    ],
-    "hotel": [
-        {"key": "tourism", "value": "hotel"},
-    ],
-    "pharmacy": [
-        {"key": "amenity", "value": "pharmacy"},
-        {"key": "shop", "value": "chemist"},
-    ],
-    "hospital": [
-        {"key": "amenity", "value": "hospital"},
-    ],
-    "school": [
-        {"key": "amenity", "value": "school"},
-    ],
-    "bank": [
-        {"key": "amenity", "value": "bank"},
-    ],
-}
+GEOAPIFY_GEOCODE_URL = "https://api.geoapify.com/v1/geocode/search"
+GEOAPIFY_PLACES_URL = "https://api.geoapify.com/v2/places"
+GEOAPIFY_PLACE_DETAILS_URL = "https://api.geoapify.com/v2/place-details"
 
 
 # =========================================================
-# SECRETS / ENV
+# SECRETS
 # =========================================================
 def get_secret(name: str, default: str = "") -> str:
     try:
@@ -103,516 +31,307 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.1-8b-instant")
-OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
+GEOAPIFY_API_KEY = get_secret("GEOAPIFY_API_KEY")
 
 
 # =========================================================
-# OPTIONAL AI CLIENT
+# CATEGORY MAPPING
+# Geoapify category names can be adjusted later if needed.
 # =========================================================
-def get_ai_client_and_mode():
-    if OpenAI is None:
-        return None, None
-
-    if GROQ_API_KEY:
-        client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-        return client, "groq"
-
-    if OPENAI_API_KEY:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        return client, "openai"
-
-    return None, None
-
-
-def ai_normalize_query(raw_query: str) -> Dict[str, Any]:
-    lower = raw_query.strip().lower()
-    fallback_tags = DEFAULT_CATEGORY_MAP.get(lower, [{"key": "name", "value": lower}])
-
-    client, mode = get_ai_client_and_mode()
-    if client is None:
-        return {
-            "normalized_query": raw_query.strip(),
-            "category": raw_query.strip(),
-            "keywords": [raw_query.strip()],
-            "tags": fallback_tags,
-        }
-
-    system_prompt = """
-You convert business search queries into OpenStreetMap-friendly metadata.
-Return only valid JSON with these keys:
-normalized_query, category, keywords, tags
-
-Rules:
-- tags must be a list of objects with keys: key, value
-- choose broad practical tags for OSM business search
-- do not return markdown
-"""
-
-    user_prompt = f"""
-Query: {raw_query}
-
-Example:
-{{
-  "normalized_query": "pizza house",
-  "category": "pizza house",
-  "keywords": ["pizza", "pizza house", "restaurant"],
-  "tags": [
-    {{"key": "cuisine", "value": "pizza"}},
-    {{"key": "amenity", "value": "restaurant"}},
-    {{"key": "amenity", "value": "fast_food"}}
-  ]
-}}
-"""
-
-    try:
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL if mode == "groq" else OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-        )
-        content = resp.choices[0].message.content
-        data = json.loads(content)
-
-        tags = data.get("tags") or fallback_tags
-        if not isinstance(tags, list):
-            tags = fallback_tags
-
-        return {
-            "normalized_query": str(data.get("normalized_query") or raw_query).strip(),
-            "category": str(data.get("category") or raw_query).strip(),
-            "keywords": data.get("keywords") or [raw_query.strip()],
-            "tags": tags,
-        }
-    except Exception:
-        return {
-            "normalized_query": raw_query.strip(),
-            "category": raw_query.strip(),
-            "keywords": [raw_query.strip()],
-            "tags": fallback_tags,
-        }
+CATEGORY_MAP = {
+    "hotel": [
+        "accommodation.hotel",
+        "accommodation.motel",
+        "accommodation.guest_house",
+        "accommodation.hostel",
+    ],
+    "hotels": [
+        "accommodation.hotel",
+        "accommodation.motel",
+        "accommodation.guest_house",
+        "accommodation.hostel",
+    ],
+    "restaurant": [
+        "catering.restaurant",
+        "catering.fast_food",
+    ],
+    "restaurants": [
+        "catering.restaurant",
+        "catering.fast_food",
+    ],
+    "cafe": [
+        "catering.cafe",
+        "catering.coffee_shop",
+    ],
+    "cafes": [
+        "catering.cafe",
+        "catering.coffee_shop",
+    ],
+    "pizza": [
+        "catering.restaurant",
+        "catering.fast_food",
+    ],
+    "pizza house": [
+        "catering.restaurant",
+        "catering.fast_food",
+    ],
+    "pizza houses": [
+        "catering.restaurant",
+        "catering.fast_food",
+    ],
+    "software house": [
+        "commercial",
+        "office",
+    ],
+    "software houses": [
+        "commercial",
+        "office",
+    ],
+    "pharmacy": [
+        "healthcare.pharmacy",
+        "commercial.pharmacy",
+    ],
+    "hospital": [
+        "healthcare.hospital",
+    ],
+    "school": [
+        "education.school",
+    ],
+    "bank": [
+        "service.financial.bank",
+    ],
+}
 
 
 # =========================================================
-# HTTP HELPERS
+# HELPERS
 # =========================================================
-def get_headers() -> Dict[str, str]:
-    return {
-        "User-Agent": APP_USER_AGENT,
-        "Accept-Language": "en",
-        "Referer": APP_REFERER,
-    }
+def normalize_query_to_categories(user_query: str):
+    q = user_query.strip().lower()
+    return CATEGORY_MAP.get(q, ["commercial", "catering.restaurant"])
 
 
-def safe_request(method: str, url: str, **kwargs) -> requests.Response:
-    headers = kwargs.pop("headers", {})
-    merged = {**get_headers(), **headers}
-    return requests.request(
-        method=method,
-        url=url,
-        headers=merged,
-        timeout=REQUEST_TIMEOUT,
-        **kwargs,
-    )
+def safe_get(url: str, params: dict):
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
 
 
-# =========================================================
-# GEO HELPERS
-# =========================================================
 def geocode_city(city: str, country: str):
     params = {
-        "city": city,
-        "country": country,
-        "format": "jsonv2",
+        "text": f"{city}, {country}",
+        "format": "json",
+        "apiKey": GEOAPIFY_API_KEY,
         "limit": 1,
     }
-    r = safe_request("GET", NOMINATIM_URL, params=params)
-    r.raise_for_status()
-    data = r.json()
 
-    if not data:
-        params = {
-            "q": f"{city}, {country}",
-            "format": "jsonv2",
-            "limit": 1,
-        }
-        r = safe_request("GET", NOMINATIM_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+    data = safe_get(GEOAPIFY_GEOCODE_URL, params)
+    results = data.get("results", [])
 
-    if not data:
+    if not results:
         return None
 
-    item = data[0]
+    item = results[0]
+
+    bbox = item.get("bbox", {})
+    lat = item.get("lat")
+    lon = item.get("lon")
+    place_id = item.get("place_id", "")
+
     return {
-        "display_name": item.get("display_name", ""),
-        "lat": float(item["lat"]),
-        "lon": float(item["lon"]),
-        "boundingbox": item.get("boundingbox", []),
+        "name": item.get("formatted", f"{city}, {country}"),
+        "lat": lat,
+        "lon": lon,
+        "place_id": place_id,
+        "bbox": bbox,
     }
 
 
-def shrink_bounds(bounds: Tuple[float, float, float, float], factor: float = 0.65):
-    south, north, west, east = bounds
-    lat_center = (south + north) / 2
-    lon_center = (west + east) / 2
+def build_rect_filter(bbox: dict):
+    # Expected bbox keys from geocoding results:
+    # lon1, lat1, lon2, lat2
+    if not bbox:
+        return None
 
-    lat_half = (north - south) * factor / 2
-    lon_half = (east - west) * factor / 2
+    lon1 = bbox.get("lon1")
+    lat1 = bbox.get("lat1")
+    lon2 = bbox.get("lon2")
+    lat2 = bbox.get("lat2")
 
-    return (
-        lat_center - lat_half,
-        lat_center + lat_half,
-        lon_center - lon_half,
-        lon_center + lon_half,
+    if None in (lon1, lat1, lon2, lat2):
+        return None
+
+    return f"rect:{lon1},{lat1},{lon2},{lat2}"
+
+
+def search_places(categories, geo, text_query="", page_limit=100, max_records=500):
+    all_features = []
+    offset = 0
+
+    rect_filter = build_rect_filter(geo.get("bbox", {}))
+
+    # Fallback to circle if bbox is unavailable
+    if rect_filter:
+        search_filter = rect_filter
+    else:
+        search_filter = f"circle:{geo['lon']},{geo['lat']},10000"
+
+    categories_str = ",".join(categories)
+
+    while True:
+        params = {
+            "categories": categories_str,
+            "filter": search_filter,
+            "bias": f"proximity:{geo['lon']},{geo['lat']}",
+            "limit": page_limit,
+            "offset": offset,
+            "apiKey": GEOAPIFY_API_KEY,
+        }
+
+        if text_query.strip():
+            params["name"] = text_query.strip()
+
+        data = safe_get(GEOAPIFY_PLACES_URL, params)
+        features = data.get("features", [])
+
+        if not features:
+            break
+
+        all_features.extend(features)
+
+        if len(features) < page_limit:
+            break
+
+        offset += page_limit
+
+        if len(all_features) >= max_records:
+            break
+
+        time.sleep(0.2)
+
+    return all_features[:max_records]
+
+
+def get_place_details(place_id: str):
+    if not place_id:
+        return {}
+
+    params = {
+        "id": place_id,
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+
+    try:
+        data = safe_get(GEOAPIFY_PLACE_DETAILS_URL, params)
+        features = data.get("features", [])
+        if features:
+            return features[0].get("properties", {})
+    except Exception:
+        return {}
+
+    return {}
+
+
+def pick_value(properties: dict, *keys):
+    for key in keys:
+        value = properties.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def feature_to_row(feature: dict, enrich_details: bool = True):
+    props = feature.get("properties", {}) or {}
+    geometry = feature.get("geometry", {}) or {}
+    coords = geometry.get("coordinates", [None, None])
+
+    lon = coords[0] if len(coords) > 0 else None
+    lat = coords[1] if len(coords) > 1 else None
+
+    place_id = pick_value(props, "place_id")
+
+    details = {}
+    if enrich_details and place_id:
+        details = get_place_details(place_id)
+
+    merged = {**props, **details}
+
+    name = pick_value(
+        merged,
+        "name",
+        "formatted",
+        "address_line1",
+    ) or "Unnamed Place"
+
+    category = ""
+    categories = merged.get("categories", [])
+    if isinstance(categories, list) and categories:
+        category = categories[0]
+    elif isinstance(categories, str):
+        category = categories
+
+    phone = pick_value(
+        merged,
+        "contact_phone",
+        "phone",
+        "datasource.raw.phone",
     )
 
-
-# =========================================================
-# OVERPASS HELPERS
-# =========================================================
-def build_single_tag_query(bounds, tag, text_query="", result_limit=100, include_name=False):
-    south, north, west, east = bounds
-    key = tag.get("key", "").strip()
-    value = tag.get("value", "").strip()
-
-    if not key or not value:
-        return ""
-
-    selector = f'["{key}"="{value}"]'
-    parts = [
-        f'node{selector}({south},{west},{north},{east});',
-        f'way{selector}({south},{west},{north},{east});',
-        f'relation{selector}({south},{west},{north},{east});',
-    ]
-
-    if include_name and text_query:
-        escaped = re.escape(text_query)
-        name_selector = f'["name"~"{escaped}",i]'
-        parts.extend([
-            f'node{name_selector}({south},{west},{north},{east});',
-            f'way{name_selector}({south},{west},{north},{east});',
-            f'relation{name_selector}({south},{west},{north},{east});',
-        ])
-
-    return f"""
-    [out:json][timeout:30];
-    (
-      {' '.join(parts)}
-    );
-    out center tags {result_limit};
-    """
-
-
-def run_overpass_query(query: str):
-    last_error = None
-
-    for endpoint in OVERPASS_ENDPOINTS:
-        try:
-            r = safe_request("POST", endpoint, data={"data": query})
-            r.raise_for_status()
-            data = r.json()
-            return data.get("elements", [])
-        except Exception as e:
-            last_error = e
-            continue
-
-    if last_error:
-        raise last_error
-    return []
-
-
-def overpass_search(bounds, tags, text_query="", result_limit=100):
-    all_elements = []
-
-    for tag in tags[:5]:
-        q = build_single_tag_query(
-            bounds=bounds,
-            tag=tag,
-            text_query="",
-            result_limit=result_limit,
-            include_name=False,
-        )
-        if not q:
-            continue
-
-        try:
-            elements = run_overpass_query(q)
-            all_elements.extend(elements)
-            time.sleep(0.5)
-        except Exception:
-            continue
-
-    if text_query:
-        small_bounds = shrink_bounds(bounds, factor=0.55)
-        name_tag = {"key": "name", "value": text_query}
-
-        q = build_single_tag_query(
-            bounds=small_bounds,
-            tag=name_tag,
-            text_query=text_query,
-            result_limit=result_limit,
-            include_name=True,
-        )
-        try:
-            elements = run_overpass_query(q)
-            all_elements.extend(elements)
-        except Exception:
-            pass
-
-    return all_elements
-
-
-# =========================================================
-# ENRICHMENT HELPERS
-# =========================================================
-def normalize_website(tags: Dict[str, Any]) -> str:
-    website = (
-        tags.get("website")
-        or tags.get("contact:website")
-        or tags.get("url")
-        or ""
-    ).strip()
-
-    if website and not website.startswith(("http://", "https://")):
-        website = "https://" + website
-
-    return website
-
-
-def normalize_phone(tags: Dict[str, Any]) -> str:
-    return (
-        tags.get("phone")
-        or tags.get("contact:phone")
-        or tags.get("mobile")
-        or ""
-    ).strip()
-
-
-def normalize_email(tags: Dict[str, Any]) -> str:
-    return (
-        tags.get("email")
-        or tags.get("contact:email")
-        or ""
-    ).strip()
-
-
-def normalize_address(tags: Dict[str, Any], lat=None, lon=None) -> str:
-    parts = [
-        tags.get("addr:housenumber", ""),
-        tags.get("addr:street", ""),
-        tags.get("addr:city", ""),
-        tags.get("addr:state", ""),
-        tags.get("addr:postcode", ""),
-        tags.get("addr:country", ""),
-    ]
-    address = ", ".join([p for p in parts if p]).strip(", ")
-
-    if address:
-        return address
-    if lat is not None and lon is not None:
-        return f"{lat}, {lon}"
-    return "Location not available"
-
-
-def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def scrape_website_text(website: str, max_chars: int = 2500) -> str:
-    if not website:
-        return ""
-
-    collected = []
-
-    for path in CONTACT_PATHS:
-        try:
-            url = website.rstrip("/") + path
-            r = safe_request("GET", url)
-            if r.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(r.text[:200000], "html.parser")
-
-            for tag in soup(["script", "style", "noscript"]):
-                tag.extract()
-
-            text = clean_text(soup.get_text(" ", strip=True))
-            if text:
-                collected.append(text[:1000])
-
-            if sum(len(x) for x in collected) >= max_chars:
-                break
-        except Exception:
-            continue
-
-    return " ".join(collected)[:max_chars]
-
-
-def extract_email_from_text(text: str) -> str:
-    if not text:
-        return ""
-    matches = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
-    return matches[0] if matches else ""
-
-
-def element_to_record(el: Dict[str, Any], enrich_website: bool = True):
-    tags = el.get("tags", {}) or {}
-
-    lat = el.get("lat")
-    lon = el.get("lon")
-    if lat is None or lon is None:
-        center = el.get("center", {})
-        lat = center.get("lat")
-        lon = center.get("lon")
-
-    website = normalize_website(tags)
-    phone = normalize_phone(tags)
-    email = normalize_email(tags)
-    address = normalize_address(tags, lat, lon)
-
-    website_text = ""
-    if enrich_website and website:
-        website_text = scrape_website_text(website)
-
-    if not email and website_text:
-        email = extract_email_from_text(website_text)
-
-    category = tags.get("amenity") or tags.get("shop") or tags.get("office") or tags.get("tourism") or "N/A"
-    name = tags.get("name", "Unnamed Place")
-
-    document_text = clean_text(
-        f"""
-        Business name: {name}
-        Category: {category}
-        Phone: {phone}
-        Email: {email}
-        Website: {website}
-        Address: {address}
-        Latitude: {lat}
-        Longitude: {lon}
-        Raw tags: {json.dumps(tags, ensure_ascii=False)}
-        Website content: {website_text}
-        """
+    email = pick_value(
+        merged,
+        "contact_email",
+        "email",
     )
+
+    website = pick_value(
+        merged,
+        "website",
+        "contact_website",
+    )
+
+    address = pick_value(
+        merged,
+        "formatted",
+        "address_line1",
+    )
+
+    city = pick_value(merged, "city", "county")
+    state = pick_value(merged, "state")
+    postcode = pick_value(merged, "postcode")
+    country = pick_value(merged, "country")
+
+    full_address_parts = [address, city, state, postcode, country]
+    full_address = ", ".join([x for x in full_address_parts if x])
 
     return {
-        "name": name,
-        "category": category,
-        "phone": phone,
-        "email": email,
-        "website": website,
-        "address": address,
-        "latitude": lat,
-        "longitude": lon,
-        "osm_type": el.get("type", ""),
-        "osm_id": el.get("id", ""),
-        "maps_link": f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}" if lat and lon else "",
-        "document_text": document_text,
+        "Name": name,
+        "Category": category,
+        "Phone": phone,
+        "Email": email,
+        "Website": website,
+        "Address": full_address or address,
+        "Latitude": lat,
+        "Longitude": lon,
+        "Place ID": place_id,
     }
 
 
-def dedupe_records(records: List[Dict[str, Any]]):
+def dedupe_rows(rows):
     seen = set()
-    final = []
+    result = []
 
-    for item in records:
+    for row in rows:
         key = (
-            (item.get("name") or "").strip().lower(),
-            str(item.get("latitude") or ""),
-            str(item.get("longitude") or ""),
+            str(row.get("Name", "")).strip().lower(),
+            str(row.get("Latitude", "")),
+            str(row.get("Longitude", "")),
         )
         if key in seen:
             continue
         seen.add(key)
-        final.append(item)
+        result.append(row)
 
-    return final
-
-
-# =========================================================
-# RAG HELPERS
-# =========================================================
-def build_knowledge_base(records: List[Dict[str, Any]]):
-    docs = [r["document_text"] for r in records]
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=10000)
-    matrix = vectorizer.fit_transform(docs)
-    return vectorizer, matrix
-
-
-def retrieve_all_records(query: str, records: List[Dict[str, Any]], vectorizer, matrix):
-    query_vector = vectorizer.transform([query])
-    scores = cosine_similarity(query_vector, matrix).flatten()
-
-    ranked_indices = scores.argsort()[::-1]
-    ranked_results = []
-
-    for idx in ranked_indices:
-        item = dict(records[idx])
-        item["retrieval_score"] = float(scores[idx])
-        ranked_results.append(item)
-
-    return ranked_results
-
-
-# =========================================================
-# MAIN PIPELINE
-# =========================================================
-def search_businesses_rag(
-    city: str,
-    country: str,
-    raw_query: str,
-    candidate_limit: int = 150,
-    enrich_website: bool = True,
-):
-    geo = geocode_city(city, country)
-    if not geo:
-        raise ValueError("City/Country not found.")
-
-    if len(geo["boundingbox"]) != 4:
-        raise ValueError("Bounding box not found for location.")
-
-    time.sleep(1.1)
-
-    south = float(geo["boundingbox"][0])
-    north = float(geo["boundingbox"][1])
-    west = float(geo["boundingbox"][2])
-    east = float(geo["boundingbox"][3])
-
-    ai_query = ai_normalize_query(raw_query)
-    tags = ai_query["tags"]
-
-    elements = overpass_search(
-        bounds=(south, north, west, east),
-        tags=tags,
-        text_query=ai_query["normalized_query"],
-        result_limit=candidate_limit,
-    )
-
-    raw_records = [element_to_record(el, enrich_website=enrich_website) for el in elements]
-    raw_records = [
-        r for r in raw_records
-        if r.get("name") or r.get("address") or r.get("latitude") or r.get("longitude")
-    ]
-    raw_records = dedupe_records(raw_records)
-
-    if not raw_records:
-        return [], geo, ai_query, 0
-
-    vectorizer, matrix = build_knowledge_base(raw_records)
-    ranked_results = retrieve_all_records(
-        query=raw_query,
-        records=raw_records,
-        vectorizer=vectorizer,
-        matrix=matrix,
-    )
-
-    return ranked_results, geo, ai_query, len(raw_records)
+    return result
 
 
 # =========================================================
@@ -622,68 +341,66 @@ with st.sidebar:
     st.header("Search Filters")
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
-    query = st.text_input("Search query", value="pizza house")
-    candidate_limit = st.slider("Maximum businesses to fetch", 20, 300, 150, 10)
-    enrich_website = st.checkbox("Enrich with website content", value=True)
+    query = st.text_input("Search query", value="hotel")
+    max_records = st.slider("Maximum businesses to fetch", 20, 500, 200, 10)
+    enrich_details = st.checkbox("Enrich with place details", value=True)
     search_btn = st.button("Search", type="primary")
 
-st.info("This version shows all matched businesses in one table.")
+if not GEOAPIFY_API_KEY:
+    st.error("Missing GEOAPIFY_API_KEY. Add it in .streamlit/secrets.toml before running the app.")
+else:
+    st.info("This version uses Geoapify and shows all fetched results in a single table.")
 
-if search_btn:
-    if not city.strip() or not country.strip() or not query.strip():
-        st.warning("Please fill in city, country, and search query.")
-    else:
-        try:
-            with st.spinner("Searching all matching businesses..."):
-                results, geo, ai_query, total_candidates = search_businesses_rag(
-                    city=city,
-                    country=country,
-                    raw_query=query,
-                    candidate_limit=candidate_limit,
-                    enrich_website=enrich_website,
-                )
+    if search_btn:
+        if not city.strip() or not country.strip() or not query.strip():
+            st.warning("Please fill in country, city, and search query.")
+        else:
+            try:
+                with st.spinner("Geocoding city..."):
+                    geo = geocode_city(city, country)
 
-            st.success(f"{len(results)} business(es) found.")
+                if not geo:
+                    st.warning("City not found.")
+                else:
+                    categories = normalize_query_to_categories(query)
 
-            with st.expander("Search details"):
-                st.write({
-                    "location_found": geo["display_name"],
-                    "normalized_query": ai_query["normalized_query"],
-                    "tags_used": ai_query["tags"],
-                    "total_candidates": total_candidates,
-                })
+                    with st.spinner("Fetching businesses from Geoapify..."):
+                        features = search_places(
+                            categories=categories,
+                            geo=geo,
+                            text_query="",
+                            page_limit=100,
+                            max_records=max_records,
+                        )
 
-            if not results:
-                st.warning("No results found.")
-            else:
-                table_rows = []
-                for item in results:
-                    table_rows.append({
-                        "Name": item.get("name", ""),
-                        "Category": item.get("category", ""),
-                        "Phone": item.get("phone", ""),
-                        "Email": item.get("email", ""),
-                        "Website": item.get("website", ""),
-                        "Address": item.get("address", ""),
-                        "Latitude": item.get("latitude", ""),
-                        "Longitude": item.get("longitude", ""),
-                        "Map Link": item.get("maps_link", ""),
-                        "Score": round(item.get("retrieval_score", 0), 4),
-                    })
+                    rows = [feature_to_row(feature, enrich_details=enrich_details) for feature in features]
+                    rows = dedupe_rows(rows)
 
-                df = pd.DataFrame(table_rows)
-                st.dataframe(df, use_container_width=True)
+                    st.success(f"{len(rows)} business(es) found.")
 
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download CSV",
-                    data=csv,
-                    file_name=f"{city}_{country}_{query.replace(' ', '_')}_all_results.csv",
-                    mime="text/csv",
-                )
+                    with st.expander("Search details"):
+                        st.write({
+                            "city_found": geo["name"],
+                            "categories_used": categories,
+                            "place_id": geo["place_id"],
+                        })
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+                    if not rows:
+                        st.warning("No results found.")
+                    else:
+                        df = pd.DataFrame(rows)
+                        st.dataframe(df, use_container_width=True)
+
+                        csv = df.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "Download CSV",
+                            data=csv,
+                            file_name=f"{city}_{country}_{query.replace(' ', '_')}_geoapify_results.csv",
+                            mime="text/csv",
+                        )
+
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 st.markdown("---")
-st.caption("RAG-based table output. Public OSM endpoints may not contain every business on the internet.")
+st.caption("Geoapify-based business search table.")
