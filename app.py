@@ -2,7 +2,7 @@ import os
 import json
 import time
 from typing import Dict, List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
 import pandas as pd
 import requests
@@ -12,6 +12,8 @@ st.set_page_config(page_title="Business Finder", layout="wide")
 
 GEOAPIFY_API_KEY = st.secrets.get("GEOAPIFY_API_KEY", os.getenv("GEOAPIFY_API_KEY", ""))
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+
+HEADERS = {"User-Agent": "business-finder-streamlit/3.0"}
 
 COUNTRY_CODE_MAP = {
     "pakistan": "pk",
@@ -26,12 +28,10 @@ COUNTRY_CODE_MAP = {
 }
 
 VALID_CATEGORIES = {
+    # Food / restaurants
     "catering",
     "catering.bar",
-    "catering.biergarten",
     "catering.cafe",
-    "catering.cafe.coffee",
-    "catering.cafe.coffee_shop",
     "catering.fast_food",
     "catering.fast_food.burger",
     "catering.fast_food.kebab",
@@ -43,7 +43,37 @@ VALID_CATEGORIES = {
     "catering.restaurant.italian",
     "catering.restaurant.pakistani",
     "catering.restaurant.pizza",
-    "catering.restaurant.steak_house",
+
+    # Broad business / commercial
+    "commercial",
+    "commercial.marketplace",
+    "commercial.shopping_mall",
+    "commercial.supermarket",
+
+    # Shops
+    "shop",
+    "shop.bakery",
+    "shop.beauty",
+    "shop.books",
+    "shop.butcher",
+    "shop.car",
+    "shop.car_repair",
+    "shop.clothes",
+    "shop.convenience",
+    "shop.department_store",
+    "shop.electronics",
+    "shop.furniture",
+    "shop.general",
+    "shop.grocery",
+    "shop.hairdresser",
+    "shop.hardware",
+    "shop.mobile_phone",
+    "shop.pharmacy",
+    "shop.stationery",
+    "shop.toys",
+
+    # Services
+    "service.vehicle.repair",
 }
 
 SEARCH_MAPPINGS = [
@@ -62,38 +92,100 @@ SEARCH_MAPPINGS = [
         "triggers": ["coffee", "coffee shop", "cafe", "cafes"],
         "categories": [
             "catering.cafe",
-            "catering.cafe.coffee",
-            "catering.cafe.coffee_shop",
             "catering.restaurant",
         ],
-        "keywords": ["coffee", "cafe", "café", "espresso", "brew", "coffee shop"],
+        "keywords": ["coffee", "coffee shop", "cafe", "café", "espresso", "brew"],
     },
     {
-        "triggers": ["restaurant", "food", "eatery", "dining"],
+        "triggers": ["restaurant", "food", "eatery", "dining", "biryani", "bbq", "burger", "karahi"],
         "categories": [
             "catering.restaurant",
             "catering.fast_food",
             "catering.cafe",
             "catering.food_court",
         ],
-        "keywords": ["restaurant", "food", "grill", "bbq", "biryani", "pizza", "burger", "cafe"],
+        "keywords": ["restaurant", "food", "eatery", "bbq", "biryani", "burger", "cafe"],
     },
     {
-        "triggers": ["burger"],
+        "triggers": ["grocery", "groceries", "kiryana", "supermarket", "mart", "general store"],
         "categories": [
-            "catering.fast_food",
-            "catering.fast_food.burger",
-            "catering.restaurant",
+            "commercial",
+            "commercial.supermarket",
+            "shop",
+            "shop.grocery",
+            "shop.convenience",
+            "shop.department_store",
+            "shop.general",
         ],
-        "keywords": ["burger", "zinger", "fast food", "grill"],
+        "keywords": ["grocery", "groceries", "kiryana", "supermarket", "mart", "store", "general store"],
     },
     {
-        "triggers": ["bakery", "cake", "cakes", "pastry", "sweet"],
+        "triggers": ["shop", "shops", "store", "stores", "business", "businesses", "market", "mall"],
         "categories": [
-            "catering",
+            "commercial",
+            "commercial.marketplace",
+            "commercial.shopping_mall",
+            "shop",
+            "shop.general",
+            "shop.department_store",
+        ],
+        "keywords": ["shop", "shops", "store", "stores", "business", "market", "mall"],
+    },
+    {
+        "triggers": ["pharmacy", "medical", "chemist"],
+        "categories": [
+            "shop.pharmacy",
+            "shop",
+            "commercial",
+        ],
+        "keywords": ["pharmacy", "medical", "chemist", "drug store"],
+    },
+    {
+        "triggers": ["electronics", "mobile", "phone", "laptop", "computer"],
+        "categories": [
+            "shop.electronics",
+            "shop.mobile_phone",
+            "shop",
+            "commercial",
+        ],
+        "keywords": ["electronics", "mobile", "phone", "laptop", "computer", "shop"],
+    },
+    {
+        "triggers": ["bakery", "cake", "cakes", "pastry", "sweet", "sweets"],
+        "categories": [
+            "shop.bakery",
             "catering.cafe",
+            "catering",
+            "shop",
         ],
-        "keywords": ["bakery", "cake", "pastry", "sweets"],
+        "keywords": ["bakery", "cake", "cakes", "pastry", "sweet", "sweets"],
+    },
+    {
+        "triggers": ["clothes", "dress", "garments", "fashion", "boutique"],
+        "categories": [
+            "shop.clothes",
+            "shop",
+            "commercial",
+        ],
+        "keywords": ["clothes", "dress", "garments", "fashion", "boutique"],
+    },
+    {
+        "triggers": ["hardware", "tools", "paint"],
+        "categories": [
+            "shop.hardware",
+            "shop",
+            "commercial",
+        ],
+        "keywords": ["hardware", "tools", "paint", "shop"],
+    },
+    {
+        "triggers": ["furniture", "sofa", "bed"],
+        "categories": [
+            "shop.furniture",
+            "shop",
+            "commercial",
+        ],
+        "keywords": ["furniture", "sofa", "bed", "home"],
     },
 ]
 
@@ -101,9 +193,12 @@ DEFAULT_CATEGORIES = [
     "catering.restaurant",
     "catering.fast_food",
     "catering.cafe",
+    "commercial",
+    "commercial.supermarket",
+    "shop",
+    "shop.general",
+    "shop.grocery",
 ]
-
-HEADERS = {"User-Agent": "business-finder-streamlit/2.1"}
 
 
 def normalize(text: str) -> str:
@@ -119,6 +214,21 @@ def dedupe_keep_order(items: List[str]) -> List[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def build_google_maps_search_link(name: str, city: str, country: str) -> str:
+    query = f"{name}, {city}, {country}"
+    return f"https://www.google.com/search?q={quote_plus(query)}"
+
+
+def is_broad_search(search_text: str) -> bool:
+    text = normalize(search_text)
+    broad_terms = [
+        "shop", "shops", "store", "stores", "business", "businesses",
+        "market", "mall", "food", "restaurant", "grocery", "groceries",
+        "mart", "general store"
+    ]
+    return any(term in text for term in broad_terms)
 
 
 def ai_expand_search(search_text: str) -> Dict:
@@ -138,16 +248,11 @@ Output format:
 }}
 
 Rules:
-- Keep strict_name_filter empty unless user is clearly searching an exact brand.
-- Prefer broad business intent, not exact business names.
-- Only return likely Geoapify categories.
-- Never return takeaway category.
-- Example for "pizza house":
-  {{
-    "keywords": ["pizza", "pizza house", "pizzeria", "restaurant"],
-    "categories": ["catering.restaurant", "catering.fast_food", "catering.restaurant.pizza", "catering.fast_food.pizza"],
-    "strict_name_filter": ""
-  }}
+- Keep strict_name_filter empty unless user clearly wants an exact brand/business name.
+- Prefer broad business intent.
+- Return only broad and likely valid categories.
+- For generic searches like grocery/shop/business/food, use broad categories.
+- Do not over-restrict the result set.
 """
 
     try:
@@ -181,7 +286,6 @@ def heuristic_expand_search(search_text: str) -> Dict:
     text = normalize(search_text)
     categories = []
     keywords = []
-    strict_name_filter = ""
 
     for item in SEARCH_MAPPINGS:
         if any(trigger in text for trigger in item["triggers"]):
@@ -198,13 +302,21 @@ def heuristic_expand_search(search_text: str) -> Dict:
     if not categories:
         categories = DEFAULT_CATEGORIES.copy()
 
-    categories = dedupe_keep_order(categories)
+    if is_broad_search(text):
+        categories.extend([
+            "commercial",
+            "commercial.supermarket",
+            "shop",
+            "shop.general",
+        ])
+
+    categories = dedupe_keep_order([c for c in categories if c in VALID_CATEGORIES])
     keywords = dedupe_keep_order([normalize(k) for k in keywords if normalize(k)])
 
     return {
-        "keywords": keywords[:12],
-        "categories": categories[:8],
-        "strict_name_filter": strict_name_filter,
+        "keywords": keywords[:20],
+        "categories": categories[:12],
+        "strict_name_filter": "",
     }
 
 
@@ -215,12 +327,17 @@ def merge_search_strategy(search_text: str) -> Dict:
     categories = heuristic["categories"][:]
     for cat in ai.get("categories", []):
         cat = cat.strip()
-        if cat not in categories:
+        if cat and cat not in categories:
             categories.append(cat)
 
     categories = [c for c in categories if c in VALID_CATEGORIES]
     if not categories:
         categories = DEFAULT_CATEGORIES.copy()
+
+    if is_broad_search(search_text):
+        for extra in ["commercial", "commercial.supermarket", "shop", "shop.general"]:
+            if extra in VALID_CATEGORIES and extra not in categories:
+                categories.append(extra)
 
     keywords = heuristic["keywords"][:]
     for kw in ai.get("keywords", []):
@@ -234,8 +351,8 @@ def merge_search_strategy(search_text: str) -> Dict:
     strict_name_filter = normalize(ai.get("strict_name_filter", "").strip())
 
     return {
-        "keywords": keywords[:15],
-        "categories": categories[:8],
+        "keywords": keywords[:25],
+        "categories": categories[:15],
         "strict_name_filter": strict_name_filter,
         "ai_raw": ai,
     }
@@ -281,34 +398,65 @@ def geocode_city(country: str, city: str) -> Dict:
     }
 
 
-def query_geoapify_places(categories: List[str], bbox: Tuple[float, float, float, float], limit: int = 60) -> List[Dict]:
+def expand_bbox(bbox: Tuple[float, float, float, float], factor: float = 0.15) -> Tuple[float, float, float, float]:
+    lon1, lat1, lon2, lat2 = bbox
+    lon_pad = (lon2 - lon1) * factor
+    lat_pad = (lat2 - lat1) * factor
+    return (lon1 - lon_pad, lat1 - lat_pad, lon2 + lon_pad, lat2 + lat_pad)
+
+
+def query_geoapify_places(
+    categories: List[str],
+    bbox: Tuple[float, float, float, float],
+    limit: int = 50,
+    max_pages: int = 4
+) -> List[Dict]:
     if not GEOAPIFY_API_KEY:
         raise ValueError("Geoapify API key missing")
 
     lon1, lat1, lon2, lat2 = bbox
     all_features: List[Dict] = []
+    seen_ids = set()
 
     category_batches = [categories[i:i + 3] for i in range(0, len(categories), 3)]
 
     for batch in category_batches:
-        params = {
-            "categories": ",".join(batch),
-            "filter": f"rect:{lon1},{lat1},{lon2},{lat2}",
-            "limit": limit,
-            "apiKey": GEOAPIFY_API_KEY,
-        }
+        for page in range(max_pages):
+            offset = page * limit
 
-        url = "https://api.geoapify.com/v2/places?" + urlencode(params)
-        resp = requests.get(url, headers=HEADERS, timeout=45)
+            params = {
+                "categories": ",".join(batch),
+                "filter": f"rect:{lon1},{lat1},{lon2},{lat2}",
+                "limit": limit,
+                "offset": offset,
+                "apiKey": GEOAPIFY_API_KEY,
+            }
 
-        if not resp.ok:
-            raise RuntimeError(
-                f"Geoapify API error {resp.status_code}: {resp.text[:500]}"
-            )
+            url = "https://api.geoapify.com/v2/places?" + urlencode(params)
+            resp = requests.get(url, headers=HEADERS, timeout=45)
 
-        payload = resp.json()
-        all_features.extend(payload.get("features", []))
-        time.sleep(0.2)
+            if not resp.ok:
+                raise RuntimeError(f"Geoapify API error {resp.status_code}: {resp.text[:500]}")
+
+            payload = resp.json()
+            features = payload.get("features", [])
+
+            if not features:
+                break
+
+            new_count = 0
+            for feature in features:
+                props = feature.get("properties", {})
+                pid = props.get("place_id") or json.dumps(props, sort_keys=True)
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_features.append(feature)
+                    new_count += 1
+
+            if new_count == 0:
+                break
+
+            time.sleep(0.15)
 
     return all_features
 
@@ -317,8 +465,10 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
     name = normalize(props.get("name", ""))
     formatted = normalize(props.get("formatted", ""))
     categories = normalize(" ".join(props.get("categories", [])))
+    street = normalize(props.get("street", ""))
+    suburb = normalize(props.get("suburb", ""))
 
-    haystack = " ".join([name, formatted, categories])
+    haystack = " ".join([name, formatted, categories, street, suburb])
 
     if strict_name_filter and strict_name_filter not in name:
         return -999
@@ -331,20 +481,31 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
             continue
 
         if kw == name:
-            score += 20
+            score += 25
         elif kw in name:
-            score += 12
+            score += 14
         elif kw in formatted:
-            score += 6
+            score += 7
         elif kw in categories:
-            score += 5
+            score += 6
         elif kw in haystack:
-            score += 3
+            score += 4
 
-    if "catering.restaurant" in props.get("categories", []):
+    category_list = props.get("categories", [])
+
+    if "catering.restaurant" in category_list:
         score += 3
-    if "catering.fast_food" in props.get("categories", []):
+    if "catering.fast_food" in category_list:
         score += 2
+    if "catering.cafe" in category_list:
+        score += 2
+    if "commercial.supermarket" in category_list:
+        score += 3
+    if "shop.grocery" in category_list:
+        score += 3
+    if "shop" in category_list:
+        score += 1
+
     if props.get("phone"):
         score += 1
     if props.get("website"):
@@ -355,7 +516,7 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
     return score
 
 
-def clean_results(features: List[Dict], keywords: List[str], strict_name_filter: str) -> pd.DataFrame:
+def clean_results(features: List[Dict], keywords: List[str], strict_name_filter: str, city: str, country: str) -> pd.DataFrame:
     rows = []
     seen = set()
 
@@ -374,16 +535,20 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
         if score < 1:
             continue
 
+        name = props.get("name", "").strip()
+        address = props.get("formatted", "").strip()
+
         rows.append({
-            "Name": props.get("name", ""),
-            "Category": ", ".join(props.get("categories", [])[:4]),
+            "Name": name,
+            "Category": ", ".join(props.get("categories", [])[:5]),
             "Phone": props.get("phone", ""),
             "Email": props.get("email", ""),
             "Website": props.get("website", ""),
-            "Address": props.get("formatted", ""),
-            "Score": score,
+            "Address": address,
             "Latitude": props.get("lat", ""),
             "Longitude": props.get("lon", ""),
+            "Google Search": build_google_maps_search_link(name or address or "business", city, country),
+            "Score": score,
         })
 
     df = pd.DataFrame(rows)
@@ -396,19 +561,24 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
 
 
 def build_download_df(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["Name", "Category", "Phone", "Email", "Website", "Address", "Latitude", "Longitude"]
+    cols = [
+        "Name", "Category", "Phone", "Email", "Website",
+        "Address", "Latitude", "Longitude", "Google Search"
+    ]
     existing_cols = [c for c in cols if c in df.columns]
     return df[existing_cols].copy()
 
 
 st.title("Business Finder")
-st.caption("Geoapify + Groq powered business search with broader matching and better city filtering")
+st.caption("Wide business search for food, grocery, shops, and general businesses")
 
 with st.sidebar:
     st.header("Search Filters")
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
-    search_text = st.text_input("Search", value="pizza house")
+    search_text = st.text_input("Search", value="grocery store")
+    max_pages = st.slider("Search depth (more = wider results)", min_value=1, max_value=8, value=4)
+    expand_area = st.checkbox("Expand city search area slightly", value=True)
     submitted = st.button("Search", type="primary")
 
 if submitted:
@@ -432,22 +602,47 @@ if submitted:
             })
 
             city_data = geocode_city(country, city)
-            st.write(f"Resolved city: {city_data['formatted']}")
+            bbox = city_data["bbox"]
 
-            features = query_geoapify_places(strategy["categories"], city_data["bbox"], limit=80)
+            if expand_area:
+                bbox = expand_bbox(bbox, factor=0.15)
+
+            st.write(f"Resolved city: {city_data['formatted']}")
+            st.write(f"Searching categories: {len(strategy['categories'])}")
+
+            features = query_geoapify_places(
+                strategy["categories"],
+                bbox,
+                limit=50,
+                max_pages=max_pages
+            )
+
             st.write(f"Raw places fetched: {len(features)}")
 
-            df = clean_results(features, strategy["keywords"], strategy["strict_name_filter"])
+            df = clean_results(
+                features,
+                strategy["keywords"],
+                strategy["strict_name_filter"],
+                city,
+                country
+            )
 
             status.update(label="Search completed", state="complete")
 
+        st.info(
+            "Results are based on Geoapify/OpenStreetMap data. "
+            "Coverage can be broad, but it may not include every business visible on Google."
+        )
+
         if df.empty:
-            st.warning("No matching businesses found. Try broader searches like 'pizza', 'restaurant', 'cafe', or 'burger'.")
+            st.warning("No matching businesses found. Try broader searches like 'shop', 'store', 'restaurant', 'market', 'grocery', or 'business'.")
         else:
             st.success(f"{len(df)} businesses found.")
-            st.dataframe(build_download_df(df), use_container_width=True)
 
-            csv_data = build_download_df(df).to_csv(index=False).encode("utf-8")
+            display_df = build_download_df(df)
+            st.dataframe(display_df, use_container_width=True)
+
+            csv_data = display_df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download CSV",
                 data=csv_data,
@@ -458,11 +653,13 @@ if submitted:
     except Exception as e:
         st.error(f"Search failed: {str(e)}")
 
-with st.expander("Why this version gives better results"):
+with st.expander("How this version works"):
     st.markdown("""
-- City ko pehle geocode kiya jata hai, phir us ke bounding box ke andar search hoti hai  
-- Broader categories use hoti hain, is liye exact name dependency kam hoti hai  
-- Invalid categories request bhejne se pehle remove kar di jati hain  
-- Groq optional hai; fail ho to heuristic search still kaam karti hai  
-- Results ko local keyword scoring se rank kiya jata hai  
+- City ko pehle geocode kiya jata hai  
+- Search ko food, grocery, shop, aur general business categories tak wide kiya gaya hai  
+- Broad search terms par extra commercial/shop categories automatically add hoti hain  
+- Geoapify pagination use hoti hai taake zyada results milen  
+- Duplicate businesses remove kiye jate hain  
+- Results local keyword scoring ke basis par rank hote hain  
+- Har result ke sath Google search link bhi milta hai  
 """)
