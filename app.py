@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -19,27 +20,24 @@ st.title("Business Finder")
 st.caption("OSM (Nominatim + Overpass) based search. Best for MVP/demo use.")
 
 
-# =============================
-# CONFIG
-# =============================
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 45
 
-# Apna real email yahan likho
 APP_USER_AGENT = "Business Finder/1.0 (contact: your-email@gmail.com)"
-
-# Streamlit app deploy hone ke baad yahan apna app URL laga dena
-# Local testing ke liye localhost theek hai
 APP_REFERER = "http://localhost:8501"
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+]
 
 DEFAULT_CATEGORY_MAP = {
     "pizza house": [
         {"key": "cuisine", "value": "pizza"},
         {"key": "amenity", "value": "restaurant"},
         {"key": "amenity", "value": "fast_food"},
-        {"key": "shop", "value": "pizza"},
     ],
     "pizza": [
         {"key": "cuisine", "value": "pizza"},
@@ -86,10 +84,9 @@ DEFAULT_CATEGORY_MAP = {
     ],
 }
 
+CONTACT_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
 
-# =============================
-# SECRETS / ENV
-# =============================
+
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
@@ -106,9 +103,6 @@ GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.1-8b-instant")
 OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 
-# =============================
-# AI CLIENT
-# =============================
 def get_ai_client_and_mode():
     if OpenAI is None:
         return None, None
@@ -147,7 +141,7 @@ normalized_query, category, keywords, tags
 
 Rules:
 - tags must be a list of objects with keys: key, value
-- Keep tags practical for OpenStreetMap
+- Keep tags practical and broad enough for OpenStreetMap
 - If unsure, return a broad safe tag set
 - No markdown
 """
@@ -177,10 +171,7 @@ Example output:
             ],
             temperature=0.1,
         )
-
         content = resp.choices[0].message.content
-
-        import json
         data = json.loads(content)
 
         tags = data.get("tags") or fallback_tags
@@ -193,7 +184,6 @@ Example output:
             "keywords": data.get("keywords") or [raw_query.strip()],
             "tags": tags,
         }
-
     except Exception:
         return {
             "normalized_query": raw_query.strip(),
@@ -203,9 +193,6 @@ Example output:
         }
 
 
-# =============================
-# HTTP HELPERS
-# =============================
 def get_headers():
     return {
         "User-Agent": APP_USER_AGENT,
@@ -226,9 +213,6 @@ def safe_request(method: str, url: str, **kwargs):
     )
 
 
-# =============================
-# OSM HELPERS
-# =============================
 def geocode_city(city: str, country: str):
     params = {
         "city": city,
@@ -242,7 +226,6 @@ def geocode_city(city: str, country: str):
     data = r.json()
 
     if not data:
-        # fallback
         params = {
             "q": f"{city}, {country}",
             "format": "jsonv2",
@@ -264,50 +247,112 @@ def geocode_city(city: str, country: str):
     }
 
 
-def build_overpass_query(bounds, tags, text_query=""):
+def shrink_bounds(bounds, factor=0.65):
     south, north, west, east = bounds
-    parts = []
+    lat_center = (south + north) / 2
+    lon_center = (west + east) / 2
 
-    for tag in tags:
-        key = tag.get("key", "").strip()
-        value = tag.get("value", "").strip()
+    lat_half = (north - south) * factor / 2
+    lon_half = (east - west) * factor / 2
 
-        if not key or not value:
-            continue
+    return (
+        lat_center - lat_half,
+        lat_center + lat_half,
+        lon_center - lon_half,
+        lon_center + lon_half,
+    )
 
-        selector = f'["{key}"="{value}"]'
-        parts.append(f'node{selector}({south},{west},{north},{east});')
-        parts.append(f'way{selector}({south},{west},{north},{east});')
-        parts.append(f'relation{selector}({south},{west},{north},{east});')
 
-    if text_query:
+def build_single_tag_query(bounds, tag, text_query="", result_limit=80, include_name=False):
+    south, north, west, east = bounds
+    key = tag.get("key", "").strip()
+    value = tag.get("value", "").strip()
+
+    if not key or not value:
+        return ""
+
+    selector = f'["{key}"="{value}"]'
+    parts = [
+        f'node{selector}({south},{west},{north},{east});',
+        f'way{selector}({south},{west},{north},{east});',
+        f'relation{selector}({south},{west},{north},{east});',
+    ]
+
+    if include_name and text_query:
         escaped = re.escape(text_query)
         name_selector = f'["name"~"{escaped}",i]'
-        parts.append(f'node{name_selector}({south},{west},{north},{east});')
-        parts.append(f'way{name_selector}({south},{west},{north},{east});')
-        parts.append(f'relation{name_selector}({south},{west},{north},{east});')
+        parts.extend([
+            f'node{name_selector}({south},{west},{north},{east});',
+            f'way{name_selector}({south},{west},{north},{east});',
+            f'relation{name_selector}({south},{west},{north},{east});',
+        ])
 
-    query = f"""
-    [out:json][timeout:40];
+    return f"""
+    [out:json][timeout:25];
     (
       {' '.join(parts)}
     );
-    out center tags;
+    out center tags {result_limit};
     """
-    return query
 
 
-def overpass_search(bounds, tags, text_query=""):
-    query = build_overpass_query(bounds, tags, text_query=text_query)
-    r = safe_request("POST", OVERPASS_URL, data={"data": query})
-    r.raise_for_status()
-    data = r.json()
-    return data.get("elements", [])
+def run_overpass_query(query):
+    last_error = None
+
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            r = safe_request("POST", endpoint, data={"data": query})
+            r.raise_for_status()
+            data = r.json()
+            return data.get("elements", [])
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise last_error
 
 
-# =============================
-# ENRICHMENT HELPERS
-# =============================
+def overpass_search(bounds, tags, text_query="", result_limit=80):
+    all_elements = []
+
+    for tag in tags[:4]:
+        q = build_single_tag_query(
+            bounds=bounds,
+            tag=tag,
+            text_query="",
+            result_limit=min(result_limit, 60),
+            include_name=False,
+        )
+        if not q:
+            continue
+
+        try:
+            elements = run_overpass_query(q)
+            all_elements.extend(elements)
+            time.sleep(0.6)
+        except Exception:
+            continue
+
+    if not all_elements and text_query:
+        small_bounds = shrink_bounds(bounds, factor=0.45)
+        fallback_tag = tags[0] if tags else {"key": "name", "value": text_query}
+
+        q = build_single_tag_query(
+            bounds=small_bounds,
+            tag=fallback_tag,
+            text_query=text_query,
+            result_limit=min(result_limit, 40),
+            include_name=True,
+        )
+        try:
+            elements = run_overpass_query(q)
+            all_elements.extend(elements)
+        except Exception:
+            pass
+
+    return all_elements
+
+
 def normalize_website(tags):
     website = (
         tags.get("website")
@@ -343,22 +388,16 @@ def extract_email_from_website(website: str):
     if not website:
         return ""
 
-    possible_urls = [
-        website,
-        website.rstrip("/") + "/contact",
-        website.rstrip("/") + "/contact-us",
-        website.rstrip("/") + "/about",
-    ]
-
     email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-    for url in possible_urls:
+    for path in CONTACT_PATHS:
         try:
+            url = website.rstrip("/") + path
             r = safe_request("GET", url)
             if r.status_code != 200:
                 continue
 
-            html = r.text[:300000]
+            html = r.text[:200000]
             found = email_pattern.findall(html)
             if found:
                 return found[0]
@@ -368,7 +407,6 @@ def extract_email_from_website(website: str):
             found = email_pattern.findall(text)
             if found:
                 return found[0]
-
         except Exception:
             continue
 
@@ -392,7 +430,7 @@ def normalize_email(tags):
     ).strip()
 
 
-def normalize_address(tags):
+def normalize_address(tags, lat=None, lon=None):
     parts = [
         tags.get("addr:housenumber", ""),
         tags.get("addr:street", ""),
@@ -401,7 +439,15 @@ def normalize_address(tags):
         tags.get("addr:postcode", ""),
         tags.get("addr:country", ""),
     ]
-    return ", ".join([p for p in parts if p]).strip(", ")
+    address = ", ".join([p for p in parts if p]).strip(", ")
+
+    if address:
+        return address
+
+    if lat is not None and lon is not None:
+        return f"{lat}, {lon}"
+
+    return "Location not available"
 
 
 def element_to_record(el):
@@ -409,7 +455,6 @@ def element_to_record(el):
 
     lat = el.get("lat")
     lon = el.get("lon")
-
     if lat is None or lon is None:
         center = el.get("center", {})
         lat = center.get("lat")
@@ -417,18 +462,17 @@ def element_to_record(el):
 
     website = normalize_website(tags)
     email = normalize_email(tags)
-
     if not email and website:
         email = extract_email_from_website(website)
 
     return {
-        "name": tags.get("name", ""),
-        "category": tags.get("amenity") or tags.get("shop") or tags.get("office") or tags.get("tourism") or "",
+        "name": tags.get("name", "Unnamed Place"),
+        "category": tags.get("amenity") or tags.get("shop") or tags.get("office") or tags.get("tourism") or "N/A",
         "phone": normalize_phone(tags),
         "email": email,
         "website": website,
         "logo_url": build_logo_url(website),
-        "address": normalize_address(tags),
+        "address": normalize_address(tags, lat, lon),
         "latitude": lat,
         "longitude": lon,
         "osm_type": el.get("type", ""),
@@ -444,25 +488,18 @@ def dedupe_records(records):
     for item in records:
         key = (
             (item.get("name") or "").strip().lower(),
-            (item.get("phone") or "").strip().lower(),
-            (item.get("website") or "").strip().lower(),
             str(item.get("latitude") or ""),
             str(item.get("longitude") or ""),
         )
-
         if key in seen:
             continue
-
         seen.add(key)
         final.append(item)
 
     return final
 
 
-# =============================
-# MAIN SEARCH
-# =============================
-def search_businesses(city: str, country: str, raw_query: str):
+def search_businesses(city: str, country: str, raw_query: str, result_limit: int = 50):
     geo = geocode_city(city, country)
     if not geo:
         raise ValueError("City/Country not found.")
@@ -470,7 +507,6 @@ def search_businesses(city: str, country: str, raw_query: str):
     if len(geo["boundingbox"]) != 4:
         raise ValueError("Bounding box not found for location.")
 
-    # Nominatim public server ke liye slow request rakho
     time.sleep(1.1)
 
     south = float(geo["boundingbox"][0])
@@ -485,65 +521,58 @@ def search_businesses(city: str, country: str, raw_query: str):
         bounds=(south, north, west, east),
         tags=tags,
         text_query=ai_query["normalized_query"],
+        result_limit=result_limit,
     )
 
     records = [element_to_record(el) for el in elements]
 
-    clean = []
-    for rec in records:
-        if rec.get("name") or rec.get("phone") or rec.get("website"):
-            clean.append(rec)
+    records = [
+        r for r in records
+        if r.get("name") or r.get("address") or r.get("latitude") or r.get("longitude")
+    ]
 
-    return dedupe_records(clean), geo, ai_query
+    return dedupe_records(records), geo, ai_query
 
 
-# =============================
-# UI
-# =============================
 with st.sidebar:
     st.header("Search Filters")
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
     query = st.text_input("What do you want to search?", value="pizza house")
-    limit = st.slider("Max results to show", 10, 200, 20, 10)
-    only_with_phone = st.checkbox("Only show items with phone")
-    only_with_website = st.checkbox("Only show items with website")
+    limit = st.slider("Max results to show", 10, 100, 30, 10)
     search_btn = st.button("Search", type="primary")
 
 st.info(
-    "Tip: Groq/OpenAI sirf query normalize karne ke liye hai. "
-    "Actual business data OpenStreetMap se aa raha hai."
+    "Tip: Groq/OpenAI is only used for query normalization. "
+    "Actual business data is coming from OpenStreetMap."
 )
 
 if search_btn:
     if not city.strip() or not country.strip() or not query.strip():
-        st.warning("City, country, aur search query fill karo.")
+        st.warning("Please fill in city, country, and search query.")
     else:
         try:
             with st.spinner("Searching businesses..."):
-                results, geo, ai_query = search_businesses(city, country, query)
-
-            if only_with_phone:
-                results = [x for x in results if x.get("phone")]
-
-            if only_with_website:
-                results = [x for x in results if x.get("website")]
+                results, geo, ai_query = search_businesses(
+                    city=city,
+                    country=country,
+                    raw_query=query,
+                    result_limit=limit,
+                )
 
             results = results[:limit]
 
-            st.success(f"{len(results)} result(s) mile.")
+            st.success(f"{len(results)} result(s) found.")
 
             with st.expander("Search details"):
-                st.write(
-                    {
-                        "location_found": geo["display_name"],
-                        "normalized_query": ai_query["normalized_query"],
-                        "tags_used": ai_query["tags"],
-                    }
-                )
+                st.write({
+                    "location_found": geo["display_name"],
+                    "normalized_query": ai_query["normalized_query"],
+                    "tags_used": ai_query["tags"],
+                })
 
             if not results:
-                st.warning("Koi result nahi mila.")
+                st.warning("No results found.")
             else:
                 df = pd.DataFrame(results)
                 st.dataframe(df, use_container_width=True)
@@ -557,7 +586,6 @@ if search_btn:
                 )
 
                 st.subheader("Cards View")
-
                 for item in results:
                     with st.container(border=True):
                         cols = st.columns([1, 3])
@@ -573,16 +601,16 @@ if search_btn:
                                 st.write("No logo")
 
                         with cols[1]:
-                            st.markdown(f"### {item.get('name') or 'N/A'}")
+                            st.markdown(f"### {item.get('name') or 'Unnamed Place'}")
                             st.write(f"**Category:** {item.get('category') or 'N/A'}")
                             st.write(f"**Phone:** {item.get('phone') or 'N/A'}")
                             st.write(f"**Email:** {item.get('email') or 'N/A'}")
                             st.write(f"**Website:** {item.get('website') or 'N/A'}")
-                            st.write(f"**Address:** {item.get('address') or 'N/A'}")
+                            st.write(f"**Address/Location:** {item.get('address') or 'N/A'}")
                             st.write(f"**OSM Link:** {item.get('maps_link') or 'N/A'}")
 
         except Exception as e:
             st.error(f"Error: {e}")
 
 st.markdown("---")
-st.caption("For demo/MVP use. Public OSM endpoints ka data har business ke liye complete nahi hota.")
+st.caption("For demo/MVP use. Public OSM endpoints may not provide complete data for every business.")
