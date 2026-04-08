@@ -13,7 +13,7 @@ st.set_page_config(page_title="Business Finder", layout="wide")
 GEOAPIFY_API_KEY = st.secrets.get("GEOAPIFY_API_KEY", os.getenv("GEOAPIFY_API_KEY", ""))
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-HEADERS = {"User-Agent": "business-finder-streamlit/3.1"}
+HEADERS = {"User-Agent": "business-finder-streamlit/4.0"}
 
 COUNTRY_CODE_MAP = {
     "pakistan": "pk",
@@ -27,9 +27,9 @@ COUNTRY_CODE_MAP = {
     "saudi arabia": "sa",
 }
 
-# Only keep categories that are documented / safe to use
+# Use only supported Geoapify-style categories
 VALID_CATEGORIES = {
-    # Food / restaurants
+    # Food
     "catering",
     "catering.bar",
     "catering.cafe",
@@ -45,11 +45,28 @@ VALID_CATEGORIES = {
     "catering.restaurant.pakistani",
     "catering.restaurant.pizza",
 
-    # Shopping / businesses
+    # Shopping / commercial
     "commercial",
     "commercial.marketplace",
     "commercial.shopping_mall",
     "commercial.supermarket",
+    "commercial.clothing",
+    "commercial.elektronics",
+    "commercial.furniture",
+    "commercial.gift_and_souvenir",
+    "commercial.health_and_beauty",
+    "commercial.outdoor_and_sport",
+    "commercial.toys",
+
+    # Healthcare
+    "healthcare",
+    "healthcare.pharmacy",
+
+    # Office / services
+    "office",
+    "service",
+    "service.financial",
+    "service.vehicle"
 }
 
 SEARCH_MAPPINGS = [
@@ -70,7 +87,7 @@ SEARCH_MAPPINGS = [
             "catering.cafe",
             "catering.restaurant",
         ],
-        "keywords": ["coffee", "coffee shop", "cafe", "café", "espresso", "brew"],
+        "keywords": ["coffee", "coffee shop", "cafe", "espresso", "brew"],
     },
     {
         "triggers": ["restaurant", "food", "eatery", "dining", "biryani", "bbq", "burger", "karahi"],
@@ -104,6 +121,8 @@ SEARCH_MAPPINGS = [
     {
         "triggers": ["pharmacy", "medical", "chemist"],
         "categories": [
+            "healthcare",
+            "healthcare.pharmacy",
             "commercial",
         ],
         "keywords": ["pharmacy", "medical", "chemist", "drug store"],
@@ -112,6 +131,7 @@ SEARCH_MAPPINGS = [
         "triggers": ["electronics", "mobile", "phone", "laptop", "computer"],
         "categories": [
             "commercial",
+            "commercial.elektronics",
         ],
         "keywords": ["electronics", "mobile", "phone", "laptop", "computer", "shop"],
     },
@@ -128,20 +148,15 @@ SEARCH_MAPPINGS = [
         "triggers": ["clothes", "dress", "garments", "fashion", "boutique"],
         "categories": [
             "commercial",
+            "commercial.clothing",
         ],
         "keywords": ["clothes", "dress", "garments", "fashion", "boutique"],
-    },
-    {
-        "triggers": ["hardware", "tools", "paint"],
-        "categories": [
-            "commercial",
-        ],
-        "keywords": ["hardware", "tools", "paint", "shop"],
     },
     {
         "triggers": ["furniture", "sofa", "bed"],
         "categories": [
             "commercial",
+            "commercial.furniture",
         ],
         "keywords": ["furniture", "sofa", "bed", "home"],
     },
@@ -153,6 +168,7 @@ DEFAULT_CATEGORIES = [
     "catering.cafe",
     "commercial",
     "commercial.supermarket",
+    "commercial.marketplace",
 ]
 
 
@@ -161,19 +177,25 @@ def normalize(text: str) -> str:
 
 
 def dedupe_keep_order(items: List[str]) -> List[str]:
-    out = []
+    output = []
     seen = set()
     for item in items:
         item = item.strip()
         if item and item not in seen:
             seen.add(item)
-            out.append(item)
-    return out
+            output.append(item)
+    return output
 
 
-def build_google_maps_search_link(name: str, city: str, country: str) -> str:
+def build_google_search_link(name: str, city: str, country: str) -> str:
     query = f"{name}, {city}, {country}"
     return f"https://www.google.com/search?q={quote_plus(query)}"
+
+
+def build_google_maps_link(lat, lon) -> str:
+    if lat in ("", None) or lon in ("", None):
+        return ""
+    return f"https://www.google.com/maps?q={lat},{lon}"
 
 
 def is_broad_search(search_text: str) -> bool:
@@ -203,11 +225,11 @@ Output format:
 }}
 
 Rules:
-- Keep strict_name_filter empty unless user clearly wants an exact brand/business name.
-- Prefer broad business intent.
-- Only use likely valid Geoapify categories.
-- For shopping / business type searches prefer "commercial" categories.
-- Do not use unsupported "shop" categories.
+- Keep strict_name_filter empty unless the user clearly wants an exact brand/business.
+- Prefer broad intent.
+- Use only likely valid Geoapify categories.
+- For broad shopping/business searches, prefer commercial categories.
+- Do not use unsupported categories.
 """
 
     try:
@@ -281,17 +303,11 @@ def merge_search_strategy(search_text: str) -> Dict:
     categories = heuristic["categories"][:]
     for cat in ai.get("categories", []):
         cat = cat.strip()
-        if cat and cat not in categories:
+        if cat and cat not in categories and cat in VALID_CATEGORIES:
             categories.append(cat)
 
-    categories = [c for c in categories if c in VALID_CATEGORIES]
     if not categories:
         categories = DEFAULT_CATEGORIES.copy()
-
-    if is_broad_search(search_text):
-        for extra in ["commercial", "commercial.supermarket", "commercial.marketplace"]:
-            if extra in VALID_CATEGORIES and extra not in categories:
-                categories.append(extra)
 
     keywords = heuristic["keywords"][:]
     for kw in ai.get("keywords", []):
@@ -308,13 +324,12 @@ def merge_search_strategy(search_text: str) -> Dict:
         "keywords": keywords[:25],
         "categories": categories[:15],
         "strict_name_filter": strict_name_filter,
-        "ai_raw": ai,
     }
 
 
 def geocode_city(country: str, city: str) -> Dict:
     if not GEOAPIFY_API_KEY:
-        raise ValueError("Geoapify API key missing")
+        raise ValueError("Geoapify API key is missing.")
 
     country_code = COUNTRY_CODE_MAP.get(normalize(country), "")
     params = {
@@ -365,9 +380,6 @@ def query_geoapify_places(
     limit: int = 50,
     max_pages: int = 4
 ) -> List[Dict]:
-    if not GEOAPIFY_API_KEY:
-        raise ValueError("Geoapify API key missing")
-
     lon1, lat1, lon2, lat2 = bbox
     all_features: List[Dict] = []
     seen_ids = set()
@@ -410,9 +422,72 @@ def query_geoapify_places(
             if new_count == 0:
                 break
 
-            time.sleep(0.15)
+            time.sleep(0.12)
 
     return all_features
+
+
+def get_place_details(place_id: str) -> Dict:
+    if not place_id:
+        return {}
+
+    params = {
+        "id": place_id,
+        "features": "details",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+    url = "https://api.geoapify.com/v2/place-details?" + urlencode(params)
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        if not resp.ok:
+            return {}
+
+        data = resp.json()
+        features = data.get("features", [])
+        if not features:
+            return {}
+
+        props = features[0].get("properties", {})
+        contact = props.get("contact", {}) or {}
+
+        return {
+            "phone": contact.get("phone", "") or props.get("phone", ""),
+            "email": contact.get("email", "") or props.get("email", ""),
+            "website": props.get("website", ""),
+        }
+    except Exception:
+        return {}
+
+
+def enrich_contacts(df: pd.DataFrame, max_rows: int = 20) -> pd.DataFrame:
+    if df.empty or "Place ID" not in df.columns:
+        return df
+
+    df = df.copy()
+    rows_to_enrich = min(len(df), max_rows)
+
+    for idx in range(rows_to_enrich):
+        place_id = df.at[idx, "Place ID"]
+        phone_missing = not str(df.at[idx, "Phone"]).strip()
+        email_missing = not str(df.at[idx, "Email"]).strip()
+        website_missing = not str(df.at[idx, "Website"]).strip()
+
+        if not place_id or not (phone_missing or email_missing or website_missing):
+            continue
+
+        details = get_place_details(place_id)
+        if details:
+            if phone_missing and details.get("phone"):
+                df.at[idx, "Phone"] = details["phone"]
+            if email_missing and details.get("email"):
+                df.at[idx, "Email"] = details["email"]
+            if website_missing and details.get("website"):
+                df.at[idx, "Website"] = details["website"]
+
+        time.sleep(0.08)
+
+    return df
 
 
 def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") -> int:
@@ -428,7 +503,6 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
         return -999
 
     score = 0
-
     for kw in keywords:
         kw = normalize(kw)
         if not kw:
@@ -459,6 +533,8 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
         score += 2
     if "commercial" in category_list:
         score += 1
+    if "healthcare.pharmacy" in category_list:
+        score += 3
 
     if props.get("phone"):
         score += 1
@@ -470,7 +546,13 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
     return score
 
 
-def clean_results(features: List[Dict], keywords: List[str], strict_name_filter: str, city: str, country: str) -> pd.DataFrame:
+def clean_results(
+    features: List[Dict],
+    keywords: List[str],
+    strict_name_filter: str,
+    city: str,
+    country: str
+) -> pd.DataFrame:
     rows = []
     seen = set()
 
@@ -491,6 +573,9 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
 
         name = props.get("name", "").strip()
         address = props.get("formatted", "").strip()
+        lat = props.get("lat", "")
+        lon = props.get("lon", "")
+        place_id = props.get("place_id", "")
 
         rows.append({
             "Name": name,
@@ -499,14 +584,15 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
             "Email": props.get("email", ""),
             "Website": props.get("website", ""),
             "Address": address,
-            "Latitude": props.get("lat", ""),
-            "Longitude": props.get("lon", ""),
-            "Google Search": build_google_maps_search_link(name or address or "business", city, country),
+            "Latitude": lat,
+            "Longitude": lon,
+            "Location Link": build_google_maps_link(lat, lon),
+            "Google Search": build_google_search_link(name or address or "business", city, country),
+            "Place ID": place_id,
             "Score": score,
         })
 
     df = pd.DataFrame(rows)
-
     if df.empty:
         return df
 
@@ -514,41 +600,50 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
     return df
 
 
-def build_download_df(df: pd.DataFrame) -> pd.DataFrame:
+def build_display_df(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
-        "Name", "Category", "Phone", "Email", "Website",
-        "Address", "Latitude", "Longitude", "Google Search"
+        "Name",
+        "Category",
+        "Phone",
+        "Email",
+        "Website",
+        "Address",
+        "Location Link",
+        "Google Search",
+        "Latitude",
+        "Longitude",
     ]
     existing_cols = [c for c in cols if c in df.columns]
     return df[existing_cols].copy()
 
 
 st.title("Business Finder")
-st.caption("Wide business search for food, grocery, shops, and general businesses")
+st.caption("Search restaurants, grocery stores, pharmacies, shops, and businesses by city")
 
 with st.sidebar:
-    st.header("Search Filters")
+    st.header("Search Settings")
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
     search_text = st.text_input("Search", value="grocery store")
-    max_pages = st.slider("Search depth (more = wider results)", min_value=1, max_value=8, value=4)
+    max_pages = st.slider("Search depth", min_value=1, max_value=8, value=4)
     expand_area = st.checkbox("Expand city search area slightly", value=True)
+    enrich_contact_data = st.checkbox("Try to fetch missing phone/email/website", value=True)
     submitted = st.button("Search", type="primary")
 
 if submitted:
     if not GEOAPIFY_API_KEY:
-        st.error("Geoapify API key missing. Add GEOAPIFY_API_KEY in Streamlit secrets or environment.")
+        st.error("Geoapify API key is missing. Add GEOAPIFY_API_KEY to Streamlit secrets or environment variables.")
         st.stop()
 
     if not country or not city or not search_text:
-        st.warning("Country, city, and search are all required.")
+        st.warning("Country, city, and search text are required.")
         st.stop()
 
     try:
-        with st.status("Preparing search...", expanded=True) as status:
+        with st.status("Searching businesses...", expanded=True) as status:
             strategy = merge_search_strategy(search_text)
 
-            st.write("Parsed search strategy:")
+            st.write("Search strategy")
             st.json({
                 "keywords": strategy["keywords"],
                 "categories": strategy["categories"],
@@ -562,7 +657,6 @@ if submitted:
                 bbox = expand_bbox(bbox, factor=0.15)
 
             st.write(f"Resolved city: {city_data['formatted']}")
-            st.write(f"Searching categories: {len(strategy['categories'])}")
 
             features = query_geoapify_places(
                 strategy["categories"],
@@ -571,7 +665,7 @@ if submitted:
                 max_pages=max_pages
             )
 
-            st.write(f"Raw places fetched: {len(features)}")
+            st.write(f"Places fetched: {len(features)}")
 
             df = clean_results(
                 features,
@@ -581,20 +675,35 @@ if submitted:
                 country
             )
 
-            status.update(label="Search completed", state="complete")
+            if enrich_contact_data and not df.empty:
+                status.update(label="Fetching missing contact details...", state="running")
+                df = enrich_contacts(df, max_rows=20)
+
+            status.update(label="Done", state="complete")
 
         st.info(
-            "Results are based on Geoapify/OpenStreetMap data. "
-            "It can be broad, but it may not include every business visible on Google."
+            "Phone numbers, emails, and websites depend on what is available in the underlying OpenStreetMap/Geoapify data, "
+            "so some businesses may still not have contact details."
         )
 
         if df.empty:
-            st.warning("No matching businesses found. Try broader searches like 'shop', 'store', 'restaurant', 'market', 'grocery', or 'business'.")
+            st.warning("No matching businesses found. Try a broader search like restaurant, grocery, pharmacy, market, or business.")
         else:
             st.success(f"{len(df)} businesses found.")
 
-            display_df = build_download_df(df)
-            st.dataframe(display_df, use_container_width=True)
+            display_df = build_display_df(df)
+
+            st.data_editor(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=True,
+                column_config={
+                    "Website": st.column_config.LinkColumn("Website"),
+                    "Location Link": st.column_config.LinkColumn("Location Link", display_text="Open Map"),
+                    "Google Search": st.column_config.LinkColumn("Google Search", display_text="Search"),
+                },
+            )
 
             csv_data = display_df.to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -607,13 +716,12 @@ if submitted:
     except Exception as e:
         st.error(f"Search failed: {str(e)}")
 
-with st.expander("How this version works"):
+with st.expander("About this app"):
     st.markdown("""
-- City ko pehle geocode kiya jata hai  
-- Search ko food, grocery, aur general commercial business categories tak wide kiya gaya hai  
-- Broad search terms par extra commercial categories automatically add hoti hain  
-- Geoapify pagination use hoti hai taake zyada results milen  
-- Duplicate businesses remove kiye jate hain  
-- Results local keyword scoring ke basis par rank hote hain  
-- Har result ke sath Google search link bhi milta hai  
+This app:
+- geocodes the city first
+- searches valid Geoapify categories inside the city area
+- ranks results using local keyword scoring
+- optionally fetches missing phone/email/website using Place Details
+- shows clickable website and map links
 """)
