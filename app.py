@@ -20,7 +20,7 @@ except Exception:
 
 st.set_page_config(page_title="Business Finder RAG", layout="wide")
 st.title("Business Finder RAG")
-st.caption("RAG-based business search using OpenStreetMap, website enrichment, retrieval, and optional AI answer generation.")
+st.caption("RAG-based business search with table output.")
 
 
 # =========================================================
@@ -34,8 +34,8 @@ OVERPASS_ENDPOINTS = [
     "https://z.overpass-api.de/api/interpreter",
 ]
 
-APP_USER_AGENT = "Business Finder RAG/1.0 (contact: your-email@gmail.com)"
-APP_REFERER = "http://localhost:8501"
+APP_USER_AGENT = "Business Finder RAG/1.0 (contact: umarasgharvehari@gmail.com)"
+APP_REFERER = "https://business-finder-rag.streamlit.app"
 
 CONTACT_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us", "/services"]
 
@@ -198,63 +198,6 @@ Example:
         }
 
 
-def ai_generate_answer(user_query: str, retrieved_docs: List[Dict[str, Any]]) -> str:
-    client, mode = get_ai_client_and_mode()
-    if client is None or not retrieved_docs:
-        return ""
-
-    context_blocks = []
-    for i, doc in enumerate(retrieved_docs, start=1):
-        context_blocks.append(
-            f"""
-Business #{i}
-Name: {doc.get("name", "N/A")}
-Category: {doc.get("category", "N/A")}
-Phone: {doc.get("phone", "N/A")}
-Email: {doc.get("email", "N/A")}
-Website: {doc.get("website", "N/A")}
-Address: {doc.get("address", "N/A")}
-Location: {doc.get("latitude", "N/A")}, {doc.get("longitude", "N/A")}
-Retrieved Score: {doc.get("retrieval_score", 0):.4f}
-Summary Text: {doc.get("document_text", "")[:1500]}
-"""
-        )
-
-    system_prompt = """
-You are a business search assistant.
-Answer only from the provided retrieved context.
-Do not invent businesses or details.
-If a field is missing, say it is not available.
-Keep the answer concise and structured.
-"""
-
-    user_prompt = f"""
-User query:
-{user_query}
-
-Retrieved context:
-{chr(10).join(context_blocks)}
-
-Write a helpful answer with:
-1. short summary
-2. top matching businesses
-3. key details for each business
-"""
-
-    try:
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL if mode == "groq" else OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return ""
-
-
 # =========================================================
 # HTTP HELPERS
 # =========================================================
@@ -281,7 +224,7 @@ def safe_request(method: str, url: str, **kwargs) -> requests.Response:
 # =========================================================
 # GEO HELPERS
 # =========================================================
-def geocode_city(city: str, country: str) -> Dict[str, Any] | None:
+def geocode_city(city: str, country: str):
     params = {
         "city": city,
         "country": country,
@@ -333,7 +276,7 @@ def shrink_bounds(bounds: Tuple[float, float, float, float], factor: float = 0.6
 # =========================================================
 # OVERPASS HELPERS
 # =========================================================
-def build_single_tag_query(bounds, tag, text_query="", result_limit=60, include_name=False) -> str:
+def build_single_tag_query(bounds, tag, text_query="", result_limit=100, include_name=False):
     south, north, west, east = bounds
     key = tag.get("key", "").strip()
     value = tag.get("value", "").strip()
@@ -358,7 +301,7 @@ def build_single_tag_query(bounds, tag, text_query="", result_limit=60, include_
         ])
 
     return f"""
-    [out:json][timeout:25];
+    [out:json][timeout:30];
     (
       {' '.join(parts)}
     );
@@ -366,7 +309,7 @@ def build_single_tag_query(bounds, tag, text_query="", result_limit=60, include_
     """
 
 
-def run_overpass_query(query: str) -> List[Dict[str, Any]]:
+def run_overpass_query(query: str):
     last_error = None
 
     for endpoint in OVERPASS_ENDPOINTS:
@@ -384,15 +327,15 @@ def run_overpass_query(query: str) -> List[Dict[str, Any]]:
     return []
 
 
-def overpass_search(bounds, tags, text_query="", result_limit=60) -> List[Dict[str, Any]]:
+def overpass_search(bounds, tags, text_query="", result_limit=100):
     all_elements = []
 
-    for tag in tags[:4]:
+    for tag in tags[:5]:
         q = build_single_tag_query(
             bounds=bounds,
             tag=tag,
             text_query="",
-            result_limit=min(result_limit, 50),
+            result_limit=result_limit,
             include_name=False,
         )
         if not q:
@@ -401,19 +344,19 @@ def overpass_search(bounds, tags, text_query="", result_limit=60) -> List[Dict[s
         try:
             elements = run_overpass_query(q)
             all_elements.extend(elements)
-            time.sleep(0.6)
+            time.sleep(0.5)
         except Exception:
             continue
 
-    if not all_elements and text_query:
-        small_bounds = shrink_bounds(bounds, factor=0.45)
-        fallback_tag = tags[0] if tags else {"key": "name", "value": text_query}
+    if text_query:
+        small_bounds = shrink_bounds(bounds, factor=0.55)
+        name_tag = {"key": "name", "value": text_query}
 
         q = build_single_tag_query(
             bounds=small_bounds,
-            tag=fallback_tag,
+            tag=name_tag,
             text_query=text_query,
-            result_limit=min(result_limit, 30),
+            result_limit=result_limit,
             include_name=True,
         )
         try:
@@ -477,27 +420,11 @@ def normalize_address(tags: Dict[str, Any], lat=None, lon=None) -> str:
     return "Location not available"
 
 
-def extract_domain(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        return parsed.netloc
-    except Exception:
-        return ""
-
-
-def build_logo_url(website: str) -> str:
-    domain = extract_domain(website)
-    if not domain:
-        return ""
-    return f"https://{domain}/favicon.ico"
-
-
 def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def scrape_website_text(website: str, max_chars: int = 3000) -> str:
+def scrape_website_text(website: str, max_chars: int = 2500) -> str:
     if not website:
         return ""
 
@@ -510,22 +437,21 @@ def scrape_website_text(website: str, max_chars: int = 3000) -> str:
             if r.status_code != 200:
                 continue
 
-            soup = BeautifulSoup(r.text[:250000], "html.parser")
+            soup = BeautifulSoup(r.text[:200000], "html.parser")
 
             for tag in soup(["script", "style", "noscript"]):
                 tag.extract()
 
             text = clean_text(soup.get_text(" ", strip=True))
             if text:
-                collected.append(text[:1200])
+                collected.append(text[:1000])
 
             if sum(len(x) for x in collected) >= max_chars:
                 break
         except Exception:
             continue
 
-    joined = " ".join(collected)
-    return joined[:max_chars]
+    return " ".join(collected)[:max_chars]
 
 
 def extract_email_from_text(text: str) -> str:
@@ -535,7 +461,7 @@ def extract_email_from_text(text: str) -> str:
     return matches[0] if matches else ""
 
 
-def element_to_record(el: Dict[str, Any], enrich_website: bool = True) -> Dict[str, Any]:
+def element_to_record(el: Dict[str, Any], enrich_website: bool = True):
     tags = el.get("tags", {}) or {}
 
     lat = el.get("lat")
@@ -570,7 +496,7 @@ def element_to_record(el: Dict[str, Any], enrich_website: bool = True) -> Dict[s
         Address: {address}
         Latitude: {lat}
         Longitude: {lon}
-        OSM tags: {json.dumps(tags, ensure_ascii=False)}
+        Raw tags: {json.dumps(tags, ensure_ascii=False)}
         Website content: {website_text}
         """
     )
@@ -581,7 +507,6 @@ def element_to_record(el: Dict[str, Any], enrich_website: bool = True) -> Dict[s
         "phone": phone,
         "email": email,
         "website": website,
-        "logo_url": build_logo_url(website),
         "address": address,
         "latitude": lat,
         "longitude": lon,
@@ -592,7 +517,7 @@ def element_to_record(el: Dict[str, Any], enrich_website: bool = True) -> Dict[s
     }
 
 
-def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def dedupe_records(records: List[Dict[str, Any]]):
     seen = set()
     final = []
 
@@ -611,42 +536,38 @@ def dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # =========================================================
-# RAG PIPELINE
+# RAG HELPERS
 # =========================================================
-def build_knowledge_base(records: List[Dict[str, Any]]) -> Tuple[TfidfVectorizer, Any]:
+def build_knowledge_base(records: List[Dict[str, Any]]):
     docs = [r["document_text"] for r in records]
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=8000)
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=10000)
     matrix = vectorizer.fit_transform(docs)
     return vectorizer, matrix
 
 
-def retrieve_relevant_records(
-    query: str,
-    records: List[Dict[str, Any]],
-    vectorizer: TfidfVectorizer,
-    matrix,
-    top_k: int = 10,
-) -> List[Dict[str, Any]]:
+def retrieve_all_records(query: str, records: List[Dict[str, Any]], vectorizer, matrix):
     query_vector = vectorizer.transform([query])
     scores = cosine_similarity(query_vector, matrix).flatten()
 
-    ranked_indices = scores.argsort()[::-1][:top_k]
-    results = []
+    ranked_indices = scores.argsort()[::-1]
+    ranked_results = []
 
     for idx in ranked_indices:
         item = dict(records[idx])
         item["retrieval_score"] = float(scores[idx])
-        results.append(item)
+        ranked_results.append(item)
 
-    return results
+    return ranked_results
 
 
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
 def search_businesses_rag(
     city: str,
     country: str,
     raw_query: str,
-    candidate_limit: int = 40,
-    retrieve_top_k: int = 10,
+    candidate_limit: int = 150,
     enrich_website: bool = True,
 ):
     geo = geocode_city(city, country)
@@ -681,19 +602,17 @@ def search_businesses_rag(
     raw_records = dedupe_records(raw_records)
 
     if not raw_records:
-        return [], geo, ai_query, "", 0
+        return [], geo, ai_query, 0
 
     vectorizer, matrix = build_knowledge_base(raw_records)
-    retrieved = retrieve_relevant_records(
+    ranked_results = retrieve_all_records(
         query=raw_query,
         records=raw_records,
         vectorizer=vectorizer,
         matrix=matrix,
-        top_k=retrieve_top_k,
     )
 
-    answer = ai_generate_answer(raw_query, retrieved)
-    return retrieved, geo, ai_query, answer, len(raw_records)
+    return ranked_results, geo, ai_query, len(raw_records)
 
 
 # =========================================================
@@ -704,92 +623,67 @@ with st.sidebar:
     country = st.text_input("Country", value="Pakistan")
     city = st.text_input("City", value="Vehari")
     query = st.text_input("Search query", value="pizza house")
-    candidate_limit = st.slider("Candidate businesses to fetch", 10, 80, 30, 10)
-    retrieve_top_k = st.slider("Top retrieved results", 5, 20, 10, 1)
+    candidate_limit = st.slider("Maximum businesses to fetch", 20, 300, 150, 10)
     enrich_website = st.checkbox("Enrich with website content", value=True)
     search_btn = st.button("Search", type="primary")
 
-st.info(
-    "This app uses a RAG-style pipeline: fetch -> enrich -> index -> retrieve -> optional AI answer."
-)
+st.info("This version shows all matched businesses in one table.")
 
 if search_btn:
     if not city.strip() or not country.strip() or not query.strip():
         st.warning("Please fill in city, country, and search query.")
     else:
         try:
-            with st.spinner("Running RAG pipeline..."):
-                retrieved_results, geo, ai_query, answer, total_candidates = search_businesses_rag(
+            with st.spinner("Searching all matching businesses..."):
+                results, geo, ai_query, total_candidates = search_businesses_rag(
                     city=city,
                     country=country,
                     raw_query=query,
                     candidate_limit=candidate_limit,
-                    retrieve_top_k=retrieve_top_k,
                     enrich_website=enrich_website,
                 )
 
-            st.success(
-                f"Fetched {total_candidates} candidate businesses and retrieved {len(retrieved_results)} top matches."
-            )
+            st.success(f"{len(results)} business(es) found.")
 
-            with st.expander("Pipeline details"):
+            with st.expander("Search details"):
                 st.write({
                     "location_found": geo["display_name"],
                     "normalized_query": ai_query["normalized_query"],
                     "tags_used": ai_query["tags"],
-                    "candidate_count": total_candidates,
-                    "retrieved_count": len(retrieved_results),
+                    "total_candidates": total_candidates,
                 })
 
-            if answer:
-                st.subheader("AI Answer")
-                st.write(answer)
-
-            if not retrieved_results:
+            if not results:
                 st.warning("No results found.")
             else:
-                df = pd.DataFrame(retrieved_results)
-                st.subheader("Retrieved Results")
+                table_rows = []
+                for item in results:
+                    table_rows.append({
+                        "Name": item.get("name", ""),
+                        "Category": item.get("category", ""),
+                        "Phone": item.get("phone", ""),
+                        "Email": item.get("email", ""),
+                        "Website": item.get("website", ""),
+                        "Address": item.get("address", ""),
+                        "Latitude": item.get("latitude", ""),
+                        "Longitude": item.get("longitude", ""),
+                        "Map Link": item.get("maps_link", ""),
+                        "Score": round(item.get("retrieval_score", 0), 4),
+                    })
+
+                df = pd.DataFrame(table_rows)
                 st.dataframe(df, use_container_width=True)
 
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download CSV",
                     data=csv,
-                    file_name=f"{city}_{country}_{query.replace(' ', '_')}_rag_results.csv",
+                    file_name=f"{city}_{country}_{query.replace(' ', '_')}_all_results.csv",
                     mime="text/csv",
                 )
-
-                st.subheader("Business Cards")
-                for item in retrieved_results:
-                    with st.container(border=True):
-                        cols = st.columns([1, 3])
-
-                        with cols[0]:
-                            logo = item.get("logo_url", "")
-                            if logo:
-                                try:
-                                    st.image(logo, width=64)
-                                except Exception:
-                                    st.write("No logo")
-                            else:
-                                st.write("No logo")
-
-                        with cols[1]:
-                            st.markdown(f"### {item.get('name') or 'Unnamed Place'}")
-                            st.write(f"**Retrieval Score:** {item.get('retrieval_score', 0):.4f}")
-                            st.write(f"**Category:** {item.get('category') or 'N/A'}")
-                            st.write(f"**Phone:** {item.get('phone') or 'N/A'}")
-                            st.write(f"**Email:** {item.get('email') or 'N/A'}")
-                            st.write(f"**Website:** {item.get('website') or 'N/A'}")
-                            st.write(f"**Address / Location:** {item.get('address') or 'N/A'}")
-                            st.write(f"**Map Link:** {item.get('maps_link') or 'N/A'}")
-
-                            with st.expander("Retrieved Document Context"):
-                                st.write(item.get("document_text", "")[:2500])
 
         except Exception as e:
             st.error(f"Error: {e}")
 
 st.markdown("---")
-st.caption("This is a lightweight RAG implementation for demo and MVP use.")
+st.caption("RAG-based table output. Public OSM endpoints may not contain every business on the internet.")
