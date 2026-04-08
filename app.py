@@ -25,30 +25,74 @@ COUNTRY_CODE_MAP = {
     "saudi arabia": "sa",
 }
 
+VALID_CATEGORIES = {
+    "catering",
+    "catering.bar",
+    "catering.biergarten",
+    "catering.cafe",
+    "catering.cafe.coffee",
+    "catering.cafe.coffee_shop",
+    "catering.fast_food",
+    "catering.fast_food.burger",
+    "catering.fast_food.kebab",
+    "catering.fast_food.pizza",
+    "catering.food_court",
+    "catering.ice_cream",
+    "catering.pub",
+    "catering.restaurant",
+    "catering.restaurant.italian",
+    "catering.restaurant.pakistani",
+    "catering.restaurant.pizza",
+    "catering.restaurant.steak_house",
+}
+
 SEARCH_MAPPINGS = [
     {
         "triggers": ["pizza", "pizza house", "pizzeria"],
-        "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway"],
+        "categories": [
+            "catering.restaurant",
+            "catering.fast_food",
+            "catering.restaurant.pizza",
+            "catering.fast_food.pizza",
+            "catering.restaurant.italian",
+        ],
         "keywords": ["pizza", "pizzeria", "pizza house", "italian", "restaurant"],
     },
     {
         "triggers": ["coffee", "coffee shop", "cafe", "cafes"],
-        "categories": ["catering.cafe", "catering.restaurant", "catering.fast_food"],
-        "keywords": ["coffee", "cafe", "café", "espresso", "brew"],
+        "categories": [
+            "catering.cafe",
+            "catering.cafe.coffee",
+            "catering.cafe.coffee_shop",
+            "catering.restaurant",
+        ],
+        "keywords": ["coffee", "cafe", "café", "espresso", "brew", "coffee shop"],
     },
     {
         "triggers": ["restaurant", "food", "eatery", "dining"],
-        "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway", "catering.cafe"],
+        "categories": [
+            "catering.restaurant",
+            "catering.fast_food",
+            "catering.cafe",
+            "catering.food_court",
+        ],
         "keywords": ["restaurant", "food", "grill", "bbq", "biryani", "pizza", "burger", "cafe"],
     },
     {
         "triggers": ["burger"],
-        "categories": ["catering.fast_food", "catering.restaurant", "catering.takeaway"],
+        "categories": [
+            "catering.fast_food",
+            "catering.fast_food.burger",
+            "catering.restaurant",
+        ],
         "keywords": ["burger", "zinger", "fast food", "grill"],
     },
     {
-        "triggers": ["bakery", "cake", "cakes", "pastry"],
-        "categories": ["catering", "commercial.food_and_drink"],
+        "triggers": ["bakery", "cake", "cakes", "pastry", "sweet"],
+        "categories": [
+            "catering",
+            "catering.cafe",
+        ],
         "keywords": ["bakery", "cake", "pastry", "sweets"],
     },
 ]
@@ -56,20 +100,34 @@ SEARCH_MAPPINGS = [
 DEFAULT_CATEGORIES = [
     "catering.restaurant",
     "catering.fast_food",
-    "catering.takeaway",
     "catering.cafe",
 ]
 
-HEADERS = {"User-Agent": "business-finder-streamlit/2.0"}
+HEADERS = {"User-Agent": "business-finder-streamlit/2.1"}
 
-def normalize(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
+
+def normalize(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def dedupe_keep_order(items: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for item in items:
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
 
 def ai_expand_search(search_text: str) -> Dict:
     if not GROQ_API_KEY:
         return {"keywords": [], "categories": [], "strict_name_filter": ""}
+
     prompt = f"""
 Return ONLY valid JSON.
+
 User search: "{search_text}"
 
 Output format:
@@ -80,15 +138,18 @@ Output format:
 }}
 
 Rules:
-- Keep strict_name_filter empty unless the user clearly wants an exact brand name.
-- Prefer broad business intent.
+- Keep strict_name_filter empty unless user is clearly searching an exact brand.
+- Prefer broad business intent, not exact business names.
+- Only return likely Geoapify categories.
+- Never return takeaway category.
 - Example for "pizza house":
   {{
     "keywords": ["pizza", "pizza house", "pizzeria", "restaurant"],
-    "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway"],
+    "categories": ["catering.restaurant", "catering.fast_food", "catering.restaurant.pizza", "catering.fast_food.pizza"],
     "strict_name_filter": ""
   }}
 """
+
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -105,9 +166,16 @@ Rules:
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
-        return json.loads(content)
+        parsed = json.loads(content)
+
+        return {
+            "keywords": parsed.get("keywords", []),
+            "categories": parsed.get("categories", []),
+            "strict_name_filter": parsed.get("strict_name_filter", ""),
+        }
     except Exception:
         return {"keywords": [], "categories": [], "strict_name_filter": ""}
+
 
 def heuristic_expand_search(search_text: str) -> Dict:
     text = normalize(search_text)
@@ -120,31 +188,25 @@ def heuristic_expand_search(search_text: str) -> Dict:
             categories.extend(item["categories"])
             keywords.extend(item["keywords"])
 
-    keywords.extend([text])
+    keywords.append(text)
+
     for piece in text.replace(",", " ").split():
+        piece = normalize(piece)
         if len(piece) > 2:
             keywords.append(piece)
 
-    dedup_keywords = []
-    seen = set()
-    for k in keywords:
-        nk = normalize(k)
-        if nk and nk not in seen:
-            seen.add(nk)
-            dedup_keywords.append(nk)
+    if not categories:
+        categories = DEFAULT_CATEGORIES.copy()
 
-    dedup_categories = []
-    seen_cat = set()
-    for c in categories or DEFAULT_CATEGORIES:
-        if c not in seen_cat:
-            seen_cat.add(c)
-            dedup_categories.append(c)
+    categories = dedupe_keep_order(categories)
+    keywords = dedupe_keep_order([normalize(k) for k in keywords if normalize(k)])
 
     return {
-        "keywords": dedup_keywords[:10],
-        "categories": dedup_categories[:6],
+        "keywords": keywords[:12],
+        "categories": categories[:8],
         "strict_name_filter": strict_name_filter,
     }
+
 
 def merge_search_strategy(search_text: str) -> Dict:
     heuristic = heuristic_expand_search(search_text)
@@ -152,8 +214,13 @@ def merge_search_strategy(search_text: str) -> Dict:
 
     categories = heuristic["categories"][:]
     for cat in ai.get("categories", []):
+        cat = cat.strip()
         if cat not in categories:
             categories.append(cat)
+
+    categories = [c for c in categories if c in VALID_CATEGORIES]
+    if not categories:
+        categories = DEFAULT_CATEGORIES.copy()
 
     keywords = heuristic["keywords"][:]
     for kw in ai.get("keywords", []):
@@ -161,13 +228,18 @@ def merge_search_strategy(search_text: str) -> Dict:
         if nkw and nkw not in keywords:
             keywords.append(nkw)
 
-    strict_name_filter = ai.get("strict_name_filter", "").strip()
+    if not keywords:
+        keywords = [normalize(search_text)]
+
+    strict_name_filter = normalize(ai.get("strict_name_filter", "").strip())
+
     return {
-        "keywords": keywords[:12],
-        "categories": categories[:8] if categories else DEFAULT_CATEGORIES,
+        "keywords": keywords[:15],
+        "categories": categories[:8],
         "strict_name_filter": strict_name_filter,
         "ai_raw": ai,
     }
+
 
 def geocode_city(country: str, city: str) -> Dict:
     if not GEOAPIFY_API_KEY:
@@ -180,6 +252,7 @@ def geocode_city(country: str, city: str) -> Dict:
         "format": "json",
         "apiKey": GEOAPIFY_API_KEY,
     }
+
     if country_code:
         params["filter"] = f"countrycode:{country_code}"
 
@@ -194,23 +267,29 @@ def geocode_city(country: str, city: str) -> Dict:
 
     result = results[0]
     bbox = result.get("bbox", {})
+
+    lon1 = bbox.get("lon1", result["lon"] - 0.15)
+    lat1 = bbox.get("lat1", result["lat"] - 0.15)
+    lon2 = bbox.get("lon2", result["lon"] + 0.15)
+    lat2 = bbox.get("lat2", result["lat"] + 0.15)
+
     return {
         "lat": result["lat"],
         "lon": result["lon"],
-        "bbox": (
-            bbox.get("lon1", result["lon"] - 0.15),
-            bbox.get("lat1", result["lat"] - 0.15),
-            bbox.get("lon2", result["lon"] + 0.15),
-            bbox.get("lat2", result["lat"] + 0.15),
-        ),
+        "bbox": (lon1, lat1, lon2, lat2),
         "formatted": result.get("formatted", f"{city}, {country}"),
     }
 
+
 def query_geoapify_places(categories: List[str], bbox: Tuple[float, float, float, float], limit: int = 60) -> List[Dict]:
+    if not GEOAPIFY_API_KEY:
+        raise ValueError("Geoapify API key missing")
+
     lon1, lat1, lon2, lat2 = bbox
     all_features: List[Dict] = []
 
-    category_batches = [categories[i:i+3] for i in range(0, len(categories), 3)]
+    category_batches = [categories[i:i + 3] for i in range(0, len(categories), 3)]
+
     for batch in category_batches:
         params = {
             "categories": ",".join(batch),
@@ -218,40 +297,49 @@ def query_geoapify_places(categories: List[str], bbox: Tuple[float, float, float
             "limit": limit,
             "apiKey": GEOAPIFY_API_KEY,
         }
+
         url = "https://api.geoapify.com/v2/places?" + urlencode(params)
         resp = requests.get(url, headers=HEADERS, timeout=45)
-        resp.raise_for_status()
+
+        if not resp.ok:
+            raise RuntimeError(
+                f"Geoapify API error {resp.status_code}: {resp.text[:500]}"
+            )
+
         payload = resp.json()
         all_features.extend(payload.get("features", []))
         time.sleep(0.2)
 
     return all_features
 
+
 def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") -> int:
     name = normalize(props.get("name", ""))
     formatted = normalize(props.get("formatted", ""))
-    categories = " ".join(props.get("categories", []))
-    categories = normalize(categories)
+    categories = normalize(" ".join(props.get("categories", [])))
+
     haystack = " ".join([name, formatted, categories])
 
-    if strict_name_filter:
-        snf = normalize(strict_name_filter)
-        if snf not in name:
-            return -999
+    if strict_name_filter and strict_name_filter not in name:
+        return -999
 
     score = 0
+
     for kw in keywords:
         kw = normalize(kw)
         if not kw:
             continue
+
         if kw == name:
             score += 20
         elif kw in name:
             score += 12
         elif kw in formatted:
-            score += 5
+            score += 6
         elif kw in categories:
-            score += 4
+            score += 5
+        elif kw in haystack:
+            score += 3
 
     if "catering.restaurant" in props.get("categories", []):
         score += 3
@@ -261,8 +349,11 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
         score += 1
     if props.get("website"):
         score += 1
+    if props.get("email"):
+        score += 1
 
     return score
+
 
 def clean_results(features: List[Dict], keywords: List[str], strict_name_filter: str) -> pd.DataFrame:
     rows = []
@@ -270,10 +361,14 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
 
     for feature in features:
         props = feature.get("properties", {})
-        key = props.get("place_id") or (normalize(props.get("name", "")), normalize(props.get("formatted", "")))
-        if key in seen:
+        unique_key = props.get("place_id") or (
+            normalize(props.get("name", "")),
+            normalize(props.get("formatted", "")),
+        )
+
+        if unique_key in seen:
             continue
-        seen.add(key)
+        seen.add(unique_key)
 
         score = score_place(props, keywords, strict_name_filter)
         if score < 1:
@@ -292,17 +387,22 @@ def clean_results(features: List[Dict], keywords: List[str], strict_name_filter:
         })
 
     df = pd.DataFrame(rows)
+
     if df.empty:
         return df
+
     df = df.sort_values(by=["Score", "Name"], ascending=[False, True]).reset_index(drop=True)
     return df
 
+
 def build_download_df(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Name", "Category", "Phone", "Email", "Website", "Address", "Latitude", "Longitude"]
-    return df[cols].copy()
+    existing_cols = [c for c in cols if c in df.columns]
+    return df[existing_cols].copy()
+
 
 st.title("Business Finder")
-st.caption("Geoapify-powered business search with better city bounding and smarter ranking")
+st.caption("Geoapify + Groq powered business search with broader matching and better city filtering")
 
 with st.sidebar:
     st.header("Search Filters")
@@ -316,47 +416,53 @@ if submitted:
         st.error("Geoapify API key missing. Add GEOAPIFY_API_KEY in Streamlit secrets or environment.")
         st.stop()
 
-    if not city or not country or not search_text:
+    if not country or not city or not search_text:
         st.warning("Country, city, and search are all required.")
         st.stop()
 
-    with st.status("Preparing search...", expanded=True) as status:
-        strategy = merge_search_strategy(search_text)
-        st.write("Parsed search strategy:")
-        st.json({
-            "keywords": strategy["keywords"],
-            "categories": strategy["categories"],
-            "strict_name_filter": strategy["strict_name_filter"],
-        })
+    try:
+        with st.status("Preparing search...", expanded=True) as status:
+            strategy = merge_search_strategy(search_text)
 
-        city_data = geocode_city(country, city)
-        st.write(f"Resolved city: {city_data['formatted']}")
+            st.write("Parsed search strategy:")
+            st.json({
+                "keywords": strategy["keywords"],
+                "categories": strategy["categories"],
+                "strict_name_filter": strategy["strict_name_filter"],
+            })
 
-        features = query_geoapify_places(strategy["categories"], city_data["bbox"], limit=80)
-        st.write(f"Raw places fetched: {len(features)}")
+            city_data = geocode_city(country, city)
+            st.write(f"Resolved city: {city_data['formatted']}")
 
-        df = clean_results(features, strategy["keywords"], strategy["strict_name_filter"])
+            features = query_geoapify_places(strategy["categories"], city_data["bbox"], limit=80)
+            st.write(f"Raw places fetched: {len(features)}")
 
-        status.update(label="Search completed", state="complete")
+            df = clean_results(features, strategy["keywords"], strategy["strict_name_filter"])
 
-    if df.empty:
-        st.warning("No matching businesses found. Try a broader search like 'restaurant', 'pizza', or 'cafe'.")
-    else:
-        st.success(f"{len(df)} businesses found.")
-        st.dataframe(build_download_df(df), use_container_width=True)
+            status.update(label="Search completed", state="complete")
 
-        csv_data = build_download_df(df).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download CSV",
-            data=csv_data,
-            file_name=f"{normalize(city).replace(' ', '_')}_{normalize(search_text).replace(' ', '_')}.csv",
-            mime="text/csv",
-        )
+        if df.empty:
+            st.warning("No matching businesses found. Try broader searches like 'pizza', 'restaurant', 'cafe', or 'burger'.")
+        else:
+            st.success(f"{len(df)} businesses found.")
+            st.dataframe(build_download_df(df), use_container_width=True)
+
+            csv_data = build_download_df(df).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name=f"{normalize(city).replace(' ', '_')}_{normalize(search_text).replace(' ', '_')}.csv",
+                mime="text/csv",
+            )
+
+    except Exception as e:
+        st.error(f"Search failed: {str(e)}")
 
 with st.expander("Why this version gives better results"):
     st.markdown("""
-1. It geocodes the city first and searches inside the city's bounding box.  
-2. It searches broader Geoapify categories instead of over-relying on a strict AI name filter.  
-3. It ranks results locally using keywords like `pizza`, `pizzeria`, `restaurant`, etc.  
-4. Groq is optional now, not a hard dependency for correct search behavior.  
+- City ko pehle geocode kiya jata hai, phir us ke bounding box ke andar search hoti hai  
+- Broader categories use hoti hain, is liye exact name dependency kam hoti hai  
+- Invalid categories request bhejne se pehle remove kar di jati hain  
+- Groq optional hai; fail ho to heuristic search still kaam karti hai  
+- Results ko local keyword scoring se rank kiya jata hai  
 """)
