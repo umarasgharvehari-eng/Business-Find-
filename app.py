@@ -1,411 +1,362 @@
 import os
-import time
 import json
-import requests
+import time
+from typing import Dict, List, Tuple
+from urllib.parse import urlencode
+
 import pandas as pd
+import requests
 import streamlit as st
-from openai import OpenAI
 
-st.set_page_config(page_title="Business Finder AI", layout="wide")
-st.title("Business Finder AI")
-st.caption("Geoapify + Groq powered business search")
+st.set_page_config(page_title="Business Finder", layout="wide")
 
+GEOAPIFY_API_KEY = st.secrets.get("GEOAPIFY_API_KEY", os.getenv("GEOAPIFY_API_KEY", ""))
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-# ==============================
-# CONFIG
-# ==============================
-GEOCODE_URL = "https://api.geoapify.com/v1/geocode/search"
-PLACES_URL = "https://api.geoapify.com/v2/places"
-REQUEST_TIMEOUT = 20
+COUNTRY_CODE_MAP = {
+    "pakistan": "pk",
+    "india": "in",
+    "united states": "us",
+    "usa": "us",
+    "united kingdom": "gb",
+    "uk": "gb",
+    "canada": "ca",
+    "uae": "ae",
+    "saudi arabia": "sa",
+}
 
+SEARCH_MAPPINGS = [
+    {
+        "triggers": ["pizza", "pizza house", "pizzeria"],
+        "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway"],
+        "keywords": ["pizza", "pizzeria", "pizza house", "italian", "restaurant"],
+    },
+    {
+        "triggers": ["coffee", "coffee shop", "cafe", "cafes"],
+        "categories": ["catering.cafe", "catering.restaurant", "catering.fast_food"],
+        "keywords": ["coffee", "cafe", "café", "espresso", "brew"],
+    },
+    {
+        "triggers": ["restaurant", "food", "eatery", "dining"],
+        "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway", "catering.cafe"],
+        "keywords": ["restaurant", "food", "grill", "bbq", "biryani", "pizza", "burger", "cafe"],
+    },
+    {
+        "triggers": ["burger"],
+        "categories": ["catering.fast_food", "catering.restaurant", "catering.takeaway"],
+        "keywords": ["burger", "zinger", "fast food", "grill"],
+    },
+    {
+        "triggers": ["bakery", "cake", "cakes", "pastry"],
+        "categories": ["catering", "commercial.food_and_drink"],
+        "keywords": ["bakery", "cake", "pastry", "sweets"],
+    },
+]
 
-# ==============================
-# SECRETS
-# ==============================
-def get_secret(name, default=""):
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.getenv(name, default)
+DEFAULT_CATEGORIES = [
+    "catering.restaurant",
+    "catering.fast_food",
+    "catering.takeaway",
+    "catering.cafe",
+]
 
+HEADERS = {"User-Agent": "business-finder-streamlit/2.0"}
 
-GEOAPIFY_API_KEY = get_secret("GEOAPIFY_API_KEY")
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
+def normalize(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
 
-if not GEOAPIFY_API_KEY:
-    st.error("GEOAPIFY_API_KEY is missing.")
-    st.stop()
-
-if not GROQ_API_KEY:
-    st.warning("GROQ_API_KEY is missing. AI query understanding will use fallback mode.")
-
-
-# ==============================
-# GROQ CLIENT
-# ==============================
-client = None
-if GROQ_API_KEY:
-    client = OpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1"
-    )
-
-
-# ==============================
-# AI QUERY PARSER
-# ==============================
-def fallback_parse_query(user_query: str):
-    q = user_query.strip().lower()
-
-    if "pizza" in q:
-        return {
-            "keywords": ["pizza", "restaurant", "fast food", "food"],
-            "name_filter": "pizza"
-        }
-    if "coffee" in q or "cafe" in q or "coffee shop" in q:
-        return {
-            "keywords": ["coffee", "cafe", "coffee shop", "restaurant"],
-            "name_filter": "coffee"
-        }
-    if "hotel" in q or "guest house" in q or "hostel" in q:
-        return {
-            "keywords": ["hotel", "guest house", "hostel", "motel"],
-            "name_filter": "hotel"
-        }
-    if "software" in q:
-        return {
-            "keywords": ["software", "software house", "it company", "office"],
-            "name_filter": "software"
-        }
-
-    return {
-        "keywords": [user_query],
-        "name_filter": user_query
-    }
-
-
-def ai_parse_query(user_query: str):
-    if not client:
-        return fallback_parse_query(user_query)
-
+def ai_expand_search(search_text: str) -> Dict:
+    if not GROQ_API_KEY:
+        return {"keywords": [], "categories": [], "strict_name_filter": ""}
     prompt = f"""
-Convert this business search query into strict JSON.
+Return ONLY valid JSON.
+User search: "{search_text}"
 
-Query: {user_query}
-
-Return ONLY valid JSON in this format:
+Output format:
 {{
-  "keywords": ["keyword1", "keyword2", "keyword3"],
-  "name_filter": "main keyword"
+  "keywords": ["..."],
+  "categories": ["geoapify_category", "..."],
+  "strict_name_filter": ""
 }}
 
 Rules:
-- keywords should be short and useful for business search
-- include related business terms
-- output JSON only
+- Keep strict_name_filter empty unless the user clearly wants an exact brand name.
+- Prefer broad business intent.
+- Example for "pizza house":
+  {{
+    "keywords": ["pizza", "pizza house", "pizzeria", "restaurant"],
+    "categories": ["catering.restaurant", "catering.fast_food", "catering.takeaway"],
+    "strict_name_filter": ""
+  }}
 """
-
     try:
-        res = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
         )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        return json.loads(content)
+    except Exception:
+        return {"keywords": [], "categories": [], "strict_name_filter": ""}
 
-        content = res.choices[0].message.content.strip()
-        parsed = json.loads(content)
+def heuristic_expand_search(search_text: str) -> Dict:
+    text = normalize(search_text)
+    categories = []
+    keywords = []
+    strict_name_filter = ""
 
-        if "keywords" not in parsed or not isinstance(parsed["keywords"], list):
-            return fallback_parse_query(user_query)
+    for item in SEARCH_MAPPINGS:
+        if any(trigger in text for trigger in item["triggers"]):
+            categories.extend(item["categories"])
+            keywords.extend(item["keywords"])
 
-        if "name_filter" not in parsed:
-            parsed["name_filter"] = user_query
+    keywords.extend([text])
+    for piece in text.replace(",", " ").split():
+        if len(piece) > 2:
+            keywords.append(piece)
 
-        return parsed
+    dedup_keywords = []
+    seen = set()
+    for k in keywords:
+        nk = normalize(k)
+        if nk and nk not in seen:
+            seen.add(nk)
+            dedup_keywords.append(nk)
 
-    except Exception as e:
-        st.warning(f"AI fallback used: {e}")
-        return fallback_parse_query(user_query)
+    dedup_categories = []
+    seen_cat = set()
+    for c in categories or DEFAULT_CATEGORIES:
+        if c not in seen_cat:
+            seen_cat.add(c)
+            dedup_categories.append(c)
 
-
-# ==============================
-# GEO LOCATION
-# ==============================
-def get_location(city, country):
-    params = {
-        "text": f"{city}, {country}",
-        "apiKey": GEOAPIFY_API_KEY
+    return {
+        "keywords": dedup_keywords[:10],
+        "categories": dedup_categories[:6],
+        "strict_name_filter": strict_name_filter,
     }
 
-    try:
-        response = requests.get(GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT)
+def merge_search_strategy(search_text: str) -> Dict:
+    heuristic = heuristic_expand_search(search_text)
+    ai = ai_expand_search(search_text)
 
-        if response.status_code != 200:
-            st.error(f"Geoapify geocoding error: {response.text}")
-            return None
+    categories = heuristic["categories"][:]
+    for cat in ai.get("categories", []):
+        if cat not in categories:
+            categories.append(cat)
 
-        data = response.json()
+    keywords = heuristic["keywords"][:]
+    for kw in ai.get("keywords", []):
+        nkw = normalize(kw)
+        if nkw and nkw not in keywords:
+            keywords.append(nkw)
 
-        # Geoapify may return FeatureCollection with "features"
-        features = data.get("features", [])
-        if not features:
-            # fallback for old format
-            results = data.get("results", [])
-            if results:
-                item = results[0]
-                return item.get("lat"), item.get("lon")
-            return None
+    strict_name_filter = ai.get("strict_name_filter", "").strip()
+    return {
+        "keywords": keywords[:12],
+        "categories": categories[:8] if categories else DEFAULT_CATEGORIES,
+        "strict_name_filter": strict_name_filter,
+        "ai_raw": ai,
+    }
 
-        feature = features[0]
-        props = feature.get("properties", {})
-        geometry = feature.get("geometry", {})
-        coords = geometry.get("coordinates", [])
+def geocode_city(country: str, city: str) -> Dict:
+    if not GEOAPIFY_API_KEY:
+        raise ValueError("Geoapify API key missing")
 
-        if len(coords) >= 2:
-            lon = coords[0]
-            lat = coords[1]
-            return lat, lon
+    country_code = COUNTRY_CODE_MAP.get(normalize(country), "")
+    params = {
+        "text": f"{city}, {country}",
+        "limit": 1,
+        "format": "json",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+    if country_code:
+        params["filter"] = f"countrycode:{country_code}"
 
-        # extra fallback
-        lat = props.get("lat")
-        lon = props.get("lon")
-        if lat is not None and lon is not None:
-            return lat, lon
+    url = "https://api.geoapify.com/v1/geocode/search?" + urlencode(params)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
 
-        return None
+    results = data.get("results", [])
+    if not results:
+        raise ValueError(f"City not found: {city}, {country}")
 
-    except Exception as e:
-        st.error(f"Location error: {e}")
-        return None
+    result = results[0]
+    bbox = result.get("bbox", {})
+    return {
+        "lat": result["lat"],
+        "lon": result["lon"],
+        "bbox": (
+            bbox.get("lon1", result["lon"] - 0.15),
+            bbox.get("lat1", result["lat"] - 0.15),
+            bbox.get("lon2", result["lon"] + 0.15),
+            bbox.get("lat2", result["lat"] + 0.15),
+        ),
+        "formatted": result.get("formatted", f"{city}, {country}"),
+    }
 
+def query_geoapify_places(categories: List[str], bbox: Tuple[float, float, float, float], limit: int = 60) -> List[Dict]:
+    lon1, lat1, lon2, lat2 = bbox
+    all_features: List[Dict] = []
 
-# ==============================
-# CATEGORY GUESS
-# ==============================
-def detect_categories(query: str):
-    q = query.lower()
-
-    if "pizza" in q:
-        return "catering"
-    if "coffee" in q or "cafe" in q:
-        return "catering"
-    if "hotel" in q or "guest house" in q or "hostel" in q or "motel" in q:
-        return "accommodation"
-    if "software" in q or "office" in q:
-        return "commercial"
-    if "restaurant" in q or "food" in q:
-        return "catering"
-
-    return "commercial,catering,accommodation"
-
-
-# ==============================
-# SEARCH
-# ==============================
-def search_places(lat, lon, keywords, query_text):
-    all_results = []
-    categories = detect_categories(query_text)
-
-    # First pass: keyword searches
-    for word in keywords:
+    category_batches = [categories[i:i+3] for i in range(0, len(categories), 3)]
+    for batch in category_batches:
         params = {
-            "categories": categories,
-            "filter": f"circle:{lon},{lat},12000",
-            "bias": f"proximity:{lon},{lat}",
-            "limit": 100,
+            "categories": ",".join(batch),
+            "filter": f"rect:{lon1},{lat1},{lon2},{lat2}",
+            "limit": limit,
             "apiKey": GEOAPIFY_API_KEY,
-            "name": word
         }
+        url = "https://api.geoapify.com/v2/places?" + urlencode(params)
+        resp = requests.get(url, headers=HEADERS, timeout=45)
+        resp.raise_for_status()
+        payload = resp.json()
+        all_features.extend(payload.get("features", []))
+        time.sleep(0.2)
 
-        try:
-            response = requests.get(PLACES_URL, params=params, timeout=REQUEST_TIMEOUT)
+    return all_features
 
-            if response.status_code != 200:
-                st.warning(f"Places API issue for '{word}': {response.text}")
-                continue
+def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") -> int:
+    name = normalize(props.get("name", ""))
+    formatted = normalize(props.get("formatted", ""))
+    categories = " ".join(props.get("categories", []))
+    categories = normalize(categories)
+    haystack = " ".join([name, formatted, categories])
 
-            data = response.json()
-            features = data.get("features", [])
-            all_results.extend(features)
-            time.sleep(0.2)
+    if strict_name_filter:
+        snf = normalize(strict_name_filter)
+        if snf not in name:
+            return -999
 
-        except Exception as e:
-            st.warning(f"Search error for '{word}': {e}")
+    score = 0
+    for kw in keywords:
+        kw = normalize(kw)
+        if not kw:
             continue
+        if kw == name:
+            score += 20
+        elif kw in name:
+            score += 12
+        elif kw in formatted:
+            score += 5
+        elif kw in categories:
+            score += 4
 
-    # Second pass: broader search without name filter if too few results
-    if len(all_results) < 5:
-        params = {
-            "categories": categories,
-            "filter": f"circle:{lon},{lat},15000",
-            "bias": f"proximity:{lon},{lat}",
-            "limit": 100,
-            "apiKey": GEOAPIFY_API_KEY
-        }
+    if "catering.restaurant" in props.get("categories", []):
+        score += 3
+    if "catering.fast_food" in props.get("categories", []):
+        score += 2
+    if props.get("phone"):
+        score += 1
+    if props.get("website"):
+        score += 1
 
-        try:
-            response = requests.get(PLACES_URL, params=params, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                data = response.json()
-                features = data.get("features", [])
-                all_results.extend(features)
-        except Exception:
-            pass
+    return score
 
-    return all_results
-
-
-# ==============================
-# RESULT FILTERING
-# ==============================
-def row_matches_query(row, query):
-    q = (query or "").strip().lower()
-    if not q:
-        return True
-
-    haystack = " ".join([
-        str(row.get("Name", "")),
-        str(row.get("Category", "")),
-        str(row.get("Address", "")),
-        str(row.get("Website", "")),
-    ]).lower()
-
-    # direct match
-    if q in haystack:
-        return True
-
-    # token match
-    tokens = [t for t in q.split() if len(t) > 2]
-    if any(token in haystack for token in tokens):
-        return True
-
-    # smart synonyms
-    if "coffee" in q and ("cafe" in haystack or "coffee" in haystack):
-        return True
-    if "pizza" in q and ("pizza" in haystack or "restaurant" in haystack or "fast_food" in haystack):
-        return True
-    if "hotel" in q and ("hotel" in haystack or "hostel" in haystack or "guest" in haystack or "accommodation" in haystack):
-        return True
-
-    return False
-
-
-# ==============================
-# FORMAT RESULTS
-# ==============================
-def format_results(features, query):
+def clean_results(features: List[Dict], keywords: List[str], strict_name_filter: str) -> pd.DataFrame:
     rows = []
+    seen = set()
 
-    for f in features:
-        try:
-            props = f.get("properties", {})
-            coords = f.get("geometry", {}).get("coordinates", [None, None])
-
-            lon = coords[0] if len(coords) > 0 else None
-            lat = coords[1] if len(coords) > 1 else None
-
-            categories = props.get("categories", [])
-            if isinstance(categories, list):
-                category_text = ", ".join(categories[:5])
-            else:
-                category_text = str(categories)
-
-            phone = (
-                props.get("phone")
-                or props.get("contact", {}).get("phone") if isinstance(props.get("contact"), dict) else ""
-            )
-
-            website = (
-                props.get("website")
-                or props.get("datasource", {}).get("raw", {}).get("website")
-                if isinstance(props.get("datasource"), dict) else ""
-            )
-
-            email = (
-                props.get("email")
-                or props.get("datasource", {}).get("raw", {}).get("email")
-                if isinstance(props.get("datasource"), dict) else ""
-            )
-
-            row = {
-                "Name": props.get("name", ""),
-                "Category": category_text,
-                "Phone": phone or "",
-                "Email": email or "",
-                "Website": website or "",
-                "Address": props.get("formatted", ""),
-                "Latitude": lat,
-                "Longitude": lon,
-                "Map": f"https://www.google.com/maps?q={lat},{lon}" if lat and lon else "",
-            }
-
-            rows.append(row)
-
-        except Exception:
+    for feature in features:
+        props = feature.get("properties", {})
+        key = props.get("place_id") or (normalize(props.get("name", "")), normalize(props.get("formatted", "")))
+        if key in seen:
             continue
+        seen.add(key)
+
+        score = score_place(props, keywords, strict_name_filter)
+        if score < 1:
+            continue
+
+        rows.append({
+            "Name": props.get("name", ""),
+            "Category": ", ".join(props.get("categories", [])[:4]),
+            "Phone": props.get("phone", ""),
+            "Email": props.get("email", ""),
+            "Website": props.get("website", ""),
+            "Address": props.get("formatted", ""),
+            "Score": score,
+            "Latitude": props.get("lat", ""),
+            "Longitude": props.get("lon", ""),
+        })
 
     df = pd.DataFrame(rows)
-
     if df.empty:
         return df
-
-    df = df.drop_duplicates(subset=["Name", "Address"])
-
-    # keep only relevant rows
-    filtered_rows = [row for row in df.to_dict(orient="records") if row_matches_query(row, query)]
-    df = pd.DataFrame(filtered_rows)
-
-    if not df.empty:
-        df = df.sort_values(by=["Name"], ascending=True).reset_index(drop=True)
-
+    df = df.sort_values(by=["Score", "Name"], ascending=[False, True]).reset_index(drop=True)
     return df
 
+def build_download_df(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Name", "Category", "Phone", "Email", "Website", "Address", "Latitude", "Longitude"]
+    return df[cols].copy()
 
-# ==============================
-# UI
-# ==============================
+st.title("Business Finder")
+st.caption("Geoapify-powered business search with better city bounding and smarter ranking")
+
 with st.sidebar:
     st.header("Search Filters")
-    country = st.text_input("Country", "Pakistan")
-    city = st.text_input("City", "Vehari")
-    query = st.text_input("Search", "pizza house")
-    btn = st.button("Search")
+    country = st.text_input("Country", value="Pakistan")
+    city = st.text_input("City", value="Vehari")
+    search_text = st.text_input("Search", value="pizza house")
+    submitted = st.button("Search", type="primary")
 
-if btn:
-    st.info("AI is understanding your query...")
-
-    parsed = ai_parse_query(query)
-    st.write("AI Parsed:", parsed)
-
-    latlon = get_location(city, country)
-
-    if not latlon:
-        st.error("City not found or geocoding API issue.")
+if submitted:
+    if not GEOAPIFY_API_KEY:
+        st.error("Geoapify API key missing. Add GEOAPIFY_API_KEY in Streamlit secrets or environment.")
         st.stop()
 
-    lat, lon = latlon
+    if not city or not country or not search_text:
+        st.warning("Country, city, and search are all required.")
+        st.stop()
 
-    st.info("Fetching businesses from Geoapify...")
+    with st.status("Preparing search...", expanded=True) as status:
+        strategy = merge_search_strategy(search_text)
+        st.write("Parsed search strategy:")
+        st.json({
+            "keywords": strategy["keywords"],
+            "categories": strategy["categories"],
+            "strict_name_filter": strategy["strict_name_filter"],
+        })
 
-    features = search_places(lat, lon, parsed["keywords"], query)
-    df = format_results(features, query)
+        city_data = geocode_city(country, city)
+        st.write(f"Resolved city: {city_data['formatted']}")
 
-    st.success(f"{len(df)} businesses found.")
+        features = query_geoapify_places(strategy["categories"], city_data["bbox"], limit=80)
+        st.write(f"Raw places fetched: {len(features)}")
+
+        df = clean_results(features, strategy["keywords"], strategy["strict_name_filter"])
+
+        status.update(label="Search completed", state="complete")
 
     if df.empty:
-        st.warning("No results found.")
+        st.warning("No matching businesses found. Try a broader search like 'restaurant', 'pizza', or 'cafe'.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.success(f"{len(df)} businesses found.")
+        st.dataframe(build_download_df(df), use_container_width=True)
 
-        csv = df.to_csv(index=False).encode("utf-8")
+        csv_data = build_download_df(df).to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download CSV",
-            data=csv,
-            file_name=f"{city}_{country}_{query.replace(' ', '_')}.csv",
-            mime="text/csv"
+            data=csv_data,
+            file_name=f"{normalize(city).replace(' ', '_')}_{normalize(search_text).replace(' ', '_')}.csv",
+            mime="text/csv",
         )
 
-st.markdown("---")
-st.caption("Geoapify + Groq powered business search")
+with st.expander("Why this version gives better results"):
+    st.markdown("""
+1. It geocodes the city first and searches inside the city's bounding box.  
+2. It searches broader Geoapify categories instead of over-relying on a strict AI name filter.  
+3. It ranks results locally using keywords like `pizza`, `pizzeria`, `restaurant`, etc.  
+4. Groq is optional now, not a hard dependency for correct search behavior.  
+""")
