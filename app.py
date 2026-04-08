@@ -6,12 +6,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Business Finder", layout="wide")
 st.title("Business Finder")
-st.caption("Geoapify-based business search with table output.")
+st.caption("Geoapify-based business search with smart category mapping, exact-name filtering, and table output.")
 
 
-# =========================================================
-# CONFIG
-# =========================================================
 REQUEST_TIMEOUT = 30
 
 GEOAPIFY_GEOCODE_URL = "https://api.geoapify.com/v1/geocode/search"
@@ -19,9 +16,6 @@ GEOAPIFY_PLACES_URL = "https://api.geoapify.com/v2/places"
 GEOAPIFY_PLACE_DETAILS_URL = "https://api.geoapify.com/v2/place-details"
 
 
-# =========================================================
-# SECRETS
-# =========================================================
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
@@ -34,10 +28,6 @@ def get_secret(name: str, default: str = "") -> str:
 GEOAPIFY_API_KEY = get_secret("GEOAPIFY_API_KEY")
 
 
-# =========================================================
-# CATEGORY MAPPING
-# Geoapify category names can be adjusted later if needed.
-# =========================================================
 CATEGORY_MAP = {
     "hotel": [
         "accommodation.hotel",
@@ -61,11 +51,11 @@ CATEGORY_MAP = {
     ],
     "cafe": [
         "catering.cafe",
-        "catering.coffee_shop",
+        "catering.coffee",
     ],
     "cafes": [
         "catering.cafe",
-        "catering.coffee_shop",
+        "catering.coffee",
     ],
     "pizza": [
         "catering.restaurant",
@@ -80,12 +70,12 @@ CATEGORY_MAP = {
         "catering.fast_food",
     ],
     "software house": [
-        "commercial",
         "office",
+        "commercial",
     ],
     "software houses": [
-        "commercial",
         "office",
+        "commercial",
     ],
     "pharmacy": [
         "healthcare.pharmacy",
@@ -103,12 +93,34 @@ CATEGORY_MAP = {
 }
 
 
-# =========================================================
-# HELPERS
-# =========================================================
-def normalize_query_to_categories(user_query: str):
-    q = user_query.strip().lower()
-    return CATEGORY_MAP.get(q, ["commercial", "catering.restaurant"])
+def normalize_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def split_query(user_query: str):
+    q = normalize_text(user_query)
+
+    if q in CATEGORY_MAP:
+        return {
+            "categories": CATEGORY_MAP[q],
+            "name_filter": "",
+            "raw_query": q,
+        }
+
+    for key in CATEGORY_MAP:
+        if key in q:
+            remaining = normalize_text(q.replace(key, " "))
+            return {
+                "categories": CATEGORY_MAP[key],
+                "name_filter": remaining,
+                "raw_query": q,
+            }
+
+    return {
+        "categories": ["commercial", "catering.restaurant"],
+        "name_filter": q,
+        "raw_query": q,
+    }
 
 
 def safe_get(url: str, params: dict):
@@ -132,24 +144,18 @@ def geocode_city(city: str, country: str):
         return None
 
     item = results[0]
-
     bbox = item.get("bbox", {})
-    lat = item.get("lat")
-    lon = item.get("lon")
-    place_id = item.get("place_id", "")
 
     return {
         "name": item.get("formatted", f"{city}, {country}"),
-        "lat": lat,
-        "lon": lon,
-        "place_id": place_id,
+        "lat": item.get("lat"),
+        "lon": item.get("lon"),
+        "place_id": item.get("place_id", ""),
         "bbox": bbox,
     }
 
 
 def build_rect_filter(bbox: dict):
-    # Expected bbox keys from geocoding results:
-    # lon1, lat1, lon2, lat2
     if not bbox:
         return None
 
@@ -164,18 +170,12 @@ def build_rect_filter(bbox: dict):
     return f"rect:{lon1},{lat1},{lon2},{lat2}"
 
 
-def search_places(categories, geo, text_query="", page_limit=100, max_records=500):
+def search_places(categories, geo, name_filter="", page_limit=100, max_records=500):
     all_features = []
     offset = 0
 
     rect_filter = build_rect_filter(geo.get("bbox", {}))
-
-    # Fallback to circle if bbox is unavailable
-    if rect_filter:
-        search_filter = rect_filter
-    else:
-        search_filter = f"circle:{geo['lon']},{geo['lat']},10000"
-
+    search_filter = rect_filter if rect_filter else f"circle:{geo['lon']},{geo['lat']},10000"
     categories_str = ",".join(categories)
 
     while True:
@@ -188,8 +188,8 @@ def search_places(categories, geo, text_query="", page_limit=100, max_records=50
             "apiKey": GEOAPIFY_API_KEY,
         }
 
-        if text_query.strip():
-            params["name"] = text_query.strip()
+        if name_filter:
+            params["name"] = name_filter
 
         data = safe_get(GEOAPIFY_PLACES_URL, params)
         features = data.get("features", [])
@@ -240,6 +240,21 @@ def pick_value(properties: dict, *keys):
     return ""
 
 
+def to_clickable_link(url: str, label: str):
+    if not url:
+        return ""
+    if not str(url).startswith(("http://", "https://")):
+        url = "https://" + str(url)
+    return f'<a href="{url}" target="_blank">{label}</a>'
+
+
+def build_map_link(lat, lon):
+    if lat in (None, "") or lon in (None, ""):
+        return ""
+    url = f"https://www.google.com/maps?q={lat},{lon}"
+    return f'<a href="{url}" target="_blank">Open Map</a>'
+
+
 def feature_to_row(feature: dict, enrich_details: bool = True):
     props = feature.get("properties", {}) or {}
     geometry = feature.get("geometry", {}) or {}
@@ -274,7 +289,6 @@ def feature_to_row(feature: dict, enrich_details: bool = True):
         merged,
         "contact_phone",
         "phone",
-        "datasource.raw.phone",
     )
 
     email = pick_value(
@@ -289,7 +303,7 @@ def feature_to_row(feature: dict, enrich_details: bool = True):
         "contact_website",
     )
 
-    address = pick_value(
+    address_line = pick_value(
         merged,
         "formatted",
         "address_line1",
@@ -300,8 +314,8 @@ def feature_to_row(feature: dict, enrich_details: bool = True):
     postcode = pick_value(merged, "postcode")
     country = pick_value(merged, "country")
 
-    full_address_parts = [address, city, state, postcode, country]
-    full_address = ", ".join([x for x in full_address_parts if x])
+    address_parts = [address_line, city, state, postcode, country]
+    full_address = ", ".join([x for x in address_parts if x])
 
     return {
         "Name": name,
@@ -309,9 +323,11 @@ def feature_to_row(feature: dict, enrich_details: bool = True):
         "Phone": phone,
         "Email": email,
         "Website": website,
-        "Address": full_address or address,
+        "Address": full_address or address_line,
         "Latitude": lat,
         "Longitude": lon,
+        "Website Link": to_clickable_link(website, "Visit Website"),
+        "Map Link": build_map_link(lat, lon),
         "Place ID": place_id,
     }
 
@@ -334,9 +350,26 @@ def dedupe_rows(rows):
     return result
 
 
-# =========================================================
-# UI
-# =========================================================
+def filter_rows_by_name(rows, name_filter: str):
+    if not name_filter:
+        return rows
+
+    q = normalize_text(name_filter)
+    filtered = []
+
+    for row in rows:
+        haystack = " ".join([
+            normalize_text(str(row.get("Name", ""))),
+            normalize_text(str(row.get("Category", ""))),
+            normalize_text(str(row.get("Address", ""))),
+        ])
+
+        if q in haystack:
+            filtered.append(row)
+
+    return filtered
+
+
 with st.sidebar:
     st.header("Search Filters")
     country = st.text_input("Country", value="Pakistan")
@@ -349,7 +382,7 @@ with st.sidebar:
 if not GEOAPIFY_API_KEY:
     st.error("Missing GEOAPIFY_API_KEY. Add it in .streamlit/secrets.toml before running the app.")
 else:
-    st.info("This version uses Geoapify and shows all fetched results in a single table.")
+    st.info("This version shows all fetched results in one table with clickable website and map links.")
 
     if search_btn:
         if not city.strip() or not country.strip() or not query.strip():
@@ -362,26 +395,28 @@ else:
                 if not geo:
                     st.warning("City not found.")
                 else:
-                    categories = normalize_query_to_categories(query)
+                    parsed = split_query(query)
 
                     with st.spinner("Fetching businesses from Geoapify..."):
                         features = search_places(
-                            categories=categories,
+                            categories=parsed["categories"],
                             geo=geo,
-                            text_query="",
+                            name_filter=parsed["name_filter"],
                             page_limit=100,
                             max_records=max_records,
                         )
 
                     rows = [feature_to_row(feature, enrich_details=enrich_details) for feature in features]
                     rows = dedupe_rows(rows)
+                    rows = filter_rows_by_name(rows, parsed["name_filter"])
 
                     st.success(f"{len(rows)} business(es) found.")
 
                     with st.expander("Search details"):
                         st.write({
                             "city_found": geo["name"],
-                            "categories_used": categories,
+                            "categories_used": parsed["categories"],
+                            "name_filter_used": parsed["name_filter"],
                             "place_id": geo["place_id"],
                         })
 
@@ -389,9 +424,18 @@ else:
                         st.warning("No results found.")
                     else:
                         df = pd.DataFrame(rows)
-                        st.dataframe(df, use_container_width=True)
 
-                        csv = df.to_csv(index=False).encode("utf-8")
+                        display_df = df.copy()
+                        if "Place ID" in display_df.columns:
+                            display_df = display_df.drop(columns=["Place ID"])
+
+                        st.dataframe(display_df, use_container_width=True)
+
+                        st.subheader("Clickable Table")
+                        html_df = display_df.to_html(escape=False, index=False)
+                        st.markdown(html_df, unsafe_allow_html=True)
+
+                        csv = display_df.to_csv(index=False).encode("utf-8")
                         st.download_button(
                             "Download CSV",
                             data=csv,
