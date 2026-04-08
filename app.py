@@ -13,7 +13,7 @@ st.set_page_config(page_title="Business Finder", layout="wide")
 GEOAPIFY_API_KEY = st.secrets.get("GEOAPIFY_API_KEY", os.getenv("GEOAPIFY_API_KEY", ""))
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-HEADERS = {"User-Agent": "business-finder-streamlit/3.0"}
+HEADERS = {"User-Agent": "business-finder-streamlit/3.1"}
 
 COUNTRY_CODE_MAP = {
     "pakistan": "pk",
@@ -27,6 +27,7 @@ COUNTRY_CODE_MAP = {
     "saudi arabia": "sa",
 }
 
+# Only keep categories that are documented / safe to use
 VALID_CATEGORIES = {
     # Food / restaurants
     "catering",
@@ -44,36 +45,11 @@ VALID_CATEGORIES = {
     "catering.restaurant.pakistani",
     "catering.restaurant.pizza",
 
-    # Broad business / commercial
+    # Shopping / businesses
     "commercial",
     "commercial.marketplace",
     "commercial.shopping_mall",
     "commercial.supermarket",
-
-    # Shops
-    "shop",
-    "shop.bakery",
-    "shop.beauty",
-    "shop.books",
-    "shop.butcher",
-    "shop.car",
-    "shop.car_repair",
-    "shop.clothes",
-    "shop.convenience",
-    "shop.department_store",
-    "shop.electronics",
-    "shop.furniture",
-    "shop.general",
-    "shop.grocery",
-    "shop.hairdresser",
-    "shop.hardware",
-    "shop.mobile_phone",
-    "shop.pharmacy",
-    "shop.stationery",
-    "shop.toys",
-
-    # Services
-    "service.vehicle.repair",
 }
 
 SEARCH_MAPPINGS = [
@@ -111,11 +87,7 @@ SEARCH_MAPPINGS = [
         "categories": [
             "commercial",
             "commercial.supermarket",
-            "shop",
-            "shop.grocery",
-            "shop.convenience",
-            "shop.department_store",
-            "shop.general",
+            "commercial.marketplace",
         ],
         "keywords": ["grocery", "groceries", "kiryana", "supermarket", "mart", "store", "general store"],
     },
@@ -125,17 +97,13 @@ SEARCH_MAPPINGS = [
             "commercial",
             "commercial.marketplace",
             "commercial.shopping_mall",
-            "shop",
-            "shop.general",
-            "shop.department_store",
+            "commercial.supermarket",
         ],
         "keywords": ["shop", "shops", "store", "stores", "business", "market", "mall"],
     },
     {
         "triggers": ["pharmacy", "medical", "chemist"],
         "categories": [
-            "shop.pharmacy",
-            "shop",
             "commercial",
         ],
         "keywords": ["pharmacy", "medical", "chemist", "drug store"],
@@ -143,9 +111,6 @@ SEARCH_MAPPINGS = [
     {
         "triggers": ["electronics", "mobile", "phone", "laptop", "computer"],
         "categories": [
-            "shop.electronics",
-            "shop.mobile_phone",
-            "shop",
             "commercial",
         ],
         "keywords": ["electronics", "mobile", "phone", "laptop", "computer", "shop"],
@@ -153,18 +118,15 @@ SEARCH_MAPPINGS = [
     {
         "triggers": ["bakery", "cake", "cakes", "pastry", "sweet", "sweets"],
         "categories": [
-            "shop.bakery",
             "catering.cafe",
             "catering",
-            "shop",
+            "commercial",
         ],
         "keywords": ["bakery", "cake", "cakes", "pastry", "sweet", "sweets"],
     },
     {
         "triggers": ["clothes", "dress", "garments", "fashion", "boutique"],
         "categories": [
-            "shop.clothes",
-            "shop",
             "commercial",
         ],
         "keywords": ["clothes", "dress", "garments", "fashion", "boutique"],
@@ -172,8 +134,6 @@ SEARCH_MAPPINGS = [
     {
         "triggers": ["hardware", "tools", "paint"],
         "categories": [
-            "shop.hardware",
-            "shop",
             "commercial",
         ],
         "keywords": ["hardware", "tools", "paint", "shop"],
@@ -181,8 +141,6 @@ SEARCH_MAPPINGS = [
     {
         "triggers": ["furniture", "sofa", "bed"],
         "categories": [
-            "shop.furniture",
-            "shop",
             "commercial",
         ],
         "keywords": ["furniture", "sofa", "bed", "home"],
@@ -195,9 +153,6 @@ DEFAULT_CATEGORIES = [
     "catering.cafe",
     "commercial",
     "commercial.supermarket",
-    "shop",
-    "shop.general",
-    "shop.grocery",
 ]
 
 
@@ -250,9 +205,9 @@ Output format:
 Rules:
 - Keep strict_name_filter empty unless user clearly wants an exact brand/business name.
 - Prefer broad business intent.
-- Return only broad and likely valid categories.
-- For generic searches like grocery/shop/business/food, use broad categories.
-- Do not over-restrict the result set.
+- Only use likely valid Geoapify categories.
+- For shopping / business type searches prefer "commercial" categories.
+- Do not use unsupported "shop" categories.
 """
 
     try:
@@ -306,8 +261,7 @@ def heuristic_expand_search(search_text: str) -> Dict:
         categories.extend([
             "commercial",
             "commercial.supermarket",
-            "shop",
-            "shop.general",
+            "commercial.marketplace",
         ])
 
     categories = dedupe_keep_order([c for c in categories if c in VALID_CATEGORIES])
@@ -335,7 +289,7 @@ def merge_search_strategy(search_text: str) -> Dict:
         categories = DEFAULT_CATEGORIES.copy()
 
     if is_broad_search(search_text):
-        for extra in ["commercial", "commercial.supermarket", "shop", "shop.general"]:
+        for extra in ["commercial", "commercial.supermarket", "commercial.marketplace"]:
             if extra in VALID_CATEGORIES and extra not in categories:
                 categories.append(extra)
 
@@ -501,9 +455,9 @@ def score_place(props: Dict, keywords: List[str], strict_name_filter: str = "") 
         score += 2
     if "commercial.supermarket" in category_list:
         score += 3
-    if "shop.grocery" in category_list:
-        score += 3
-    if "shop" in category_list:
+    if "commercial.marketplace" in category_list:
+        score += 2
+    if "commercial" in category_list:
         score += 1
 
     if props.get("phone"):
@@ -631,7 +585,7 @@ if submitted:
 
         st.info(
             "Results are based on Geoapify/OpenStreetMap data. "
-            "Coverage can be broad, but it may not include every business visible on Google."
+            "It can be broad, but it may not include every business visible on Google."
         )
 
         if df.empty:
@@ -656,8 +610,8 @@ if submitted:
 with st.expander("How this version works"):
     st.markdown("""
 - City ko pehle geocode kiya jata hai  
-- Search ko food, grocery, shop, aur general business categories tak wide kiya gaya hai  
-- Broad search terms par extra commercial/shop categories automatically add hoti hain  
+- Search ko food, grocery, aur general commercial business categories tak wide kiya gaya hai  
+- Broad search terms par extra commercial categories automatically add hoti hain  
 - Geoapify pagination use hoti hai taake zyada results milen  
 - Duplicate businesses remove kiye jate hain  
 - Results local keyword scoring ke basis par rank hote hain  
